@@ -372,6 +372,20 @@ class _PhotoBridge(QObject):
     thumb_done  = Signal()
 
 
+class _TransferBridge(QObject):
+    """
+    Qt signal bridge — safely delivers TransferEngine worker-thread callbacks
+    to the main thread. TransferEngine invokes its callbacks directly from a
+    plain threading.Thread; emitting a Signal from that thread and connecting
+    it to a slot here is what actually marshals the call onto the Qt main
+    thread (Qt auto-queues cross-thread signal delivery). QTimer.singleShot
+    does NOT do this — it only fires if the thread it was created on is
+    pumping an event loop, which a bare threading.Thread never does.
+    """
+    job_progress  = Signal(object)   # TransferJob
+    all_complete  = Signal()
+
+
 # ── VLC iPhone path helper ────────────────────────────────────────────────────
 
 VLC_DOCUMENTS_PATH = "AppDomain-org.videolan.vlc-ios/Documents"
@@ -759,7 +773,18 @@ class MusicTab(QWidget):
         self._scanner = MusicScanner()
         self._transfer = TransferEngine()
         self._mount_point: Optional[str] = None
-        self._tracks: List[Track] = []
+
+        # _all_tracks is the full master list, indexed the same way the
+        # scanner's own hydration-progress indices are (scan order).
+        # _displayed_tracks is whatever is currently in the table — the
+        # full list, or a filtered subset — and _path_to_row maps a track's
+        # stable path identity to its current row. Every row-based action
+        # must resolve through _displayed_tracks/_path_to_row, never index
+        # into _all_tracks with a table row number: filtering changes which
+        # rows are visible without reordering _all_tracks.
+        self._all_tracks: List[Track] = []
+        self._displayed_tracks: List[Track] = []
+        self._path_to_row: dict = {}
 
         # Bridge: scanner background thread → main thread via Qt signals
         self._bridge = _MusicBridge()
@@ -767,6 +792,13 @@ class MusicTab(QWidget):
         self._bridge.complete.connect(self._populate_table)
         self._bridge.hydrated.connect(self._refresh_rows)
         self._bridge.hyd_done.connect(self._on_hydration_done)
+
+        # Bridge: TransferEngine worker thread → main thread via Qt signals
+        # (see _TransferBridge docstring — QTimer.singleShot from that
+        # thread would silently never fire).
+        self._transfer_bridge = _TransferBridge()
+        self._transfer_bridge.job_progress.connect(self._on_transfer_progress)
+        self._transfer_bridge.all_complete.connect(self._on_transfer_complete)
 
         self._setup_ui()
         self._setup_scanner()
@@ -855,13 +887,24 @@ class MusicTab(QWidget):
     def set_player(self, player):
         self._player = player
 
+    def _track_at_row(self, row: int) -> Optional[Track]:
+        """
+        Resolve the track for a table row against what's actually displayed
+        (self._displayed_tracks), not the unfiltered master list — filtering
+        changes which rows are visible without reordering _all_tracks, so a
+        raw row index into _all_tracks would silently name the wrong track.
+        """
+        if 0 <= row < len(self._displayed_tracks):
+            return self._displayed_tracks[row]
+        return None
+
     def _on_double_click(self, index):
         """Double-click a track to load it into the player and start playing."""
         if not hasattr(self, '_player') or not self._player:
             return
         row = index.row()
-        if row < len(self._tracks):
-            self._player.set_playlist(self._tracks, row)
+        if self._track_at_row(row) is not None:
+            self._player.set_playlist(self._displayed_tracks, row)
 
     def _show_context_menu(self, pos):
         """Right-click context menu on the track table."""
@@ -869,7 +912,7 @@ class MusicTab(QWidget):
         if not index.isValid():
             return
         row = index.row()
-        if row >= len(self._tracks):
+        if self._track_at_row(row) is None:
             return
 
         menu = QMenu(self)
@@ -907,15 +950,15 @@ class MusicTab(QWidget):
             self._edit_tags(row)
         elif action == play_action:
             if hasattr(self, '_player') and self._player:
-                self._player.set_playlist(self._tracks, row)
+                self._player.set_playlist(self._displayed_tracks, row)
         elif action == export_action:
             self._export_selected()
 
     def _edit_tags(self, row: int):
-        """Open the tag editor for the track at the given table row."""
-        if row >= len(self._tracks):
+        """Open the tag editor for the track visibly at the given table row."""
+        track = self._track_at_row(row)
+        if track is None:
             return
-        track = self._tracks[row]
         if not track.tags_loaded:
             QMessageBox.information(
                 self, "Loading Metadata",
@@ -950,9 +993,13 @@ class MusicTab(QWidget):
         )
 
     def _setup_transfer(self):
+        # These callbacks run on TransferEngine's background worker thread.
+        # Emitting a signal here (rather than touching widgets directly, or
+        # using QTimer.singleShot) is what safely marshals the update onto
+        # the Qt main thread — see _TransferBridge.
         self._transfer.set_callbacks(
-            on_job_progress=self._on_transfer_progress,
-            on_all_complete=self._on_transfer_complete,
+            on_job_progress=self._transfer_bridge.job_progress.emit,
+            on_all_complete=self._transfer_bridge.all_complete.emit,
         )
 
     def load_from_mount(self, mount_point: str):
@@ -981,7 +1028,7 @@ class MusicTab(QWidget):
         self.status_message.emit(f"Finding tracks... {current}/{total}")
 
     def _populate_table(self, tracks):
-        self._tracks = tracks
+        self._all_tracks = tracks
         self.scan_progress.hide()
 
         if not tracks:
@@ -1001,7 +1048,14 @@ class MusicTab(QWidget):
         a repaint on every row insertion.
         Col 0: artwork icon (placeholder until tags hydrate)
         Col 1-6: Title, Artist, Album, Duration, Size, Year
+
+        Whatever list is passed here becomes the displayed set — every
+        row-based action resolves against it (see _track_at_row), so this
+        is the single place that _displayed_tracks/_path_to_row are updated.
         """
+        self._displayed_tracks = tracks
+        self._path_to_row = {track.path: row for row, track in enumerate(tracks)}
+
         _placeholder = _make_placeholder_icon(40)
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(tracks))
@@ -1037,14 +1091,23 @@ class MusicTab(QWidget):
     # ── Phase 2 callbacks — delivered via _MusicBridge signals ─────────────
 
     def _refresh_rows(self, indices: list):
-        """Update only the rows whose tags have just been loaded."""
+        """
+        Update only the rows whose tags have just been loaded.
+        `indices` are positions into _all_tracks (the scanner's own master
+        list order) — NOT table rows. Resolve each to a track, then to its
+        current on-screen row via _path_to_row, since a filter may be active
+        and hydration can complete for tracks that aren't currently visible.
+        """
         _placeholder = _make_placeholder_icon(40)
         self.table.setUpdatesEnabled(False)
 
-        for row in indices:
-            if row >= len(self._tracks):
+        for master_idx in indices:
+            if master_idx >= len(self._all_tracks):
                 continue
-            track = self._tracks[row]
+            track = self._all_tracks[master_idx]
+            row = self._path_to_row.get(track.path)
+            if row is None:
+                continue   # filtered out — nothing on screen to update
 
             # Col 0 — update artwork icon now that tags are loaded
             art_item = self.table.item(row, 0)
@@ -1075,11 +1138,11 @@ class MusicTab(QWidget):
 
     def _on_hydration_done(self):
         """Slot: connected to _bridge.hyd_done signal."""
-        self.status_message.emit(f"{len(self._tracks)} tracks — metadata loaded")
+        self.status_message.emit(f"{len(self._all_tracks)} tracks — metadata loaded")
 
     def _filter_tracks(self, query: str):
         if not query:
-            self._fill_table(self._tracks)
+            self._fill_table(self._all_tracks)
         else:
             filtered = self._scanner.filter_tracks(query)
             self._fill_table(filtered)
@@ -1108,7 +1171,7 @@ class MusicTab(QWidget):
                 continue
             src_path = src_item.data(Qt.UserRole)
 
-            track = self._tracks[r] if r < len(self._tracks) else None
+            track = self._track_at_row(r)
             ext = Path(src_path).suffix.lower()
 
             if track and track.title:
@@ -1178,15 +1241,19 @@ class MusicTab(QWidget):
         self.status_message.emit(f"Sending {len(files)} file(s) to VLC on iPhone...")
         self._transfer.start()
 
+    def is_transfer_active(self) -> bool:
+        """Public state MainWindow can check before unmounting/closing."""
+        return self._transfer.is_running
+
     def _on_transfer_progress(self, job):
+        """Slot: connected to _transfer_bridge.job_progress — always on main thread."""
         completed = sum(1 for j in self._transfer.queue if j.status == TransferStatus.COMPLETE)
-        QTimer.singleShot(0, lambda: self.transfer_bar.setValue(completed))
+        self.transfer_bar.setValue(completed)
 
     def _on_transfer_complete(self):
-        QTimer.singleShot(0, lambda: (
-            self.transfer_bar.hide(),
-            self.status_message.emit("Transfer complete!")
-        ))
+        """Slot: connected to _transfer_bridge.all_complete — always on main thread."""
+        self.transfer_bar.hide()
+        self.status_message.emit("Transfer complete!")
 
 
 class PhotoGrid(QWidget):
@@ -1947,8 +2014,20 @@ class MyComputerTab(QWidget):
         super().__init__(parent)
         self._current_path = os.path.expanduser("~/Music")
         self._mount_point: Optional[str] = None
+
+        # Bridge: TransferEngine worker thread → main thread via Qt signals
+        # (see _TransferBridge docstring — QTimer.singleShot from that
+        # thread would silently never fire).
+        self._transfer_bridge = _TransferBridge()
+        self._transfer_bridge.job_progress.connect(self._on_transfer_progress)
+        self._transfer_bridge.all_complete.connect(self._on_transfer_complete)
+
         self._setup_ui()
         self._navigate(self._current_path)
+
+    def is_transfer_active(self) -> bool:
+        """Public state MainWindow can check before unmounting/closing."""
+        return self._transfer.is_running
 
     def set_player(self, player):
         self._player = player
@@ -2088,11 +2167,12 @@ class MyComputerTab(QWidget):
         self.transfer_bar.hide()
         layout.addWidget(self.transfer_bar)
 
-        # Transfer engine
+        # Transfer engine — callbacks run on its background worker thread,
+        # so they're wired to bridge signal emitters, not the slots directly.
         self._transfer = TransferEngine()
         self._transfer.set_callbacks(
-            on_job_progress=self._on_transfer_progress,
-            on_all_complete=self._on_transfer_complete,
+            on_job_progress=self._transfer_bridge.job_progress.emit,
+            on_all_complete=self._transfer_bridge.all_complete.emit,
         )
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -2291,17 +2371,17 @@ class MyComputerTab(QWidget):
         self._transfer.start()
 
     def _on_transfer_progress(self, job):
+        """Slot: connected to _transfer_bridge.job_progress — always on main thread."""
         completed = sum(
             1 for j in self._transfer.queue
             if j.status == TransferStatus.COMPLETE
         )
-        QTimer.singleShot(0, lambda: self.transfer_bar.setValue(completed))
+        self.transfer_bar.setValue(completed)
 
     def _on_transfer_complete(self):
-        QTimer.singleShot(0, lambda: (
-            self.transfer_bar.hide(),
-            self.status_message.emit("Transfer complete! Files sent to iPhone.")
-        ))
+        """Slot: connected to _transfer_bridge.all_complete — always on main thread."""
+        self.transfer_bar.hide()
+        self.status_message.emit("Transfer complete! Files sent to iPhone.")
 
 
 class PlayerBar(QWidget):
@@ -2615,7 +2695,8 @@ class DeviceToolsTab(QWidget):
 
     def set_mount_point(self, mount_point: Optional[str]):
         self._mount_point = mount_point
-        self.cleanup_btn.setEnabled(mount_point is not None)
+        # cleanup_btn stays permanently disabled — see the note above
+        # _make_cleanup_card / where the old handlers used to be.
 
     def _setup_ui(self):
         outer = QVBoxLayout(self)
@@ -2689,11 +2770,14 @@ class DeviceToolsTab(QWidget):
         layout.addLayout(title_row)
 
         desc = QLabel(
-            "Removes orphaned audio files from the iPhone's iTunes_Control/Music/ "
-            "folders and clears the iTunes database stubs (iTunesDB, iTunesCDB, "
-            "iTunesControl).\n\n"
-            "Use this to free up space occupied by music the iPhone can no longer "
-            "see, or to start fresh before re-syncing with your Mac."
+            "Safe orphan cleanup — removing only the audio files the iPhone's "
+            "own library no longer references — is not implemented in this "
+            "build.\n\n"
+            "An earlier version of this feature deleted the entire "
+            "iTunes_Control/Music/ folder tree and the iTunes sync database "
+            "outright, with no orphan check at all. That destructive "
+            "implementation has been removed. This card is a placeholder "
+            "until real orphan-detection logic exists."
         )
         desc.setStyleSheet(
             f"font-size: 12px; color: {TEXT_SECONDARY}; "
@@ -2703,8 +2787,7 @@ class DeviceToolsTab(QWidget):
         layout.addWidget(desc)
 
         warning = QLabel(
-            "⚠  This permanently deletes files from your iPhone. "
-            "Make sure you have copies first."
+            "⚠  Not available yet — no cleanup action is performed by this card."
         )
         warning.setStyleSheet(
             f"font-size: 11px; color: {WARNING}; background: transparent; border: none;"
@@ -2714,11 +2797,14 @@ class DeviceToolsTab(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self.cleanup_btn = QPushButton("🧹  Clean Music Library")
+        self.cleanup_btn = QPushButton("🧹  Not Available Yet")
         self.cleanup_btn.setObjectName("dangerBtn")
         self.cleanup_btn.setFixedHeight(36)
         self.cleanup_btn.setEnabled(False)
-        self.cleanup_btn.clicked.connect(self._run_cleanup)
+        self.cleanup_btn.setToolTip(
+            "Safe orphan cleanup is not implemented in this build. "
+            "No destructive action is available here."
+        )
         btn_row.addWidget(self.cleanup_btn)
         layout.addLayout(btn_row)
 
@@ -2769,85 +2855,14 @@ class DeviceToolsTab(QWidget):
 
         return card
 
-    def _run_cleanup(self):
-        if not self._mount_point:
-            QMessageBox.warning(self, "Not Mounted", "Mount your iPhone first.")
-            return
-
-        reply = QMessageBox.warning(
-            self,
-            "Clean Music Library",
-            "This will permanently delete:\n\n"
-            "  • All audio files in iTunes_Control/Music/F##/ folders\n"
-            "  • iTunes database files (iTunesDB, iTunesCDB, iTunesControl)\n\n"
-            "This frees space and lets your iPhone start fresh on the next sync.\n\n"
-            "Are you sure? This cannot be undone.",
-            QMessageBox.Yes | QMessageBox.Cancel,
-            QMessageBox.Cancel,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        self.cleanup_btn.setEnabled(False)
-        self.cleanup_btn.setText("Cleaning...")
-        self.status_message.emit("Cleaning iPhone music library...")
-
-        import threading
-        threading.Thread(target=self._do_cleanup, daemon=True).start()
-
-    def _do_cleanup(self):
-        deleted = 0
-        errors = []
-        try:
-            itunes_music = os.path.join(
-                self._mount_point, "iTunes_Control", "Music"
-            )
-            if os.path.isdir(itunes_music):
-                for entry in os.listdir(itunes_music):
-                    folder = os.path.join(itunes_music, entry)
-                    if os.path.isdir(folder) and entry.upper().startswith("F"):
-                        try:
-                            import shutil as _shutil
-                            _shutil.rmtree(folder)
-                            deleted += 1
-                        except Exception as e:
-                            errors.append(str(e))
-
-            itunes_dir = os.path.join(
-                self._mount_point, "iTunes_Control", "iTunes"
-            )
-            for fname in ["iTunesDB", "iTunesCDB", "iTunesControl",
-                          "iTunesPrefs", "iTunesPrefs.plist"]:
-                fpath = os.path.join(itunes_dir, fname)
-                if os.path.exists(fpath):
-                    try:
-                        os.remove(fpath)
-                        deleted += 1
-                    except Exception as e:
-                        errors.append(str(e))
-        except Exception as e:
-            errors.append(str(e))
-
-        QTimer.singleShot(0, lambda: self._cleanup_done(deleted, errors))
-
-    def _cleanup_done(self, deleted: int, errors: list):
-        self.cleanup_btn.setEnabled(True)
-        self.cleanup_btn.setText("🧹  Clean Music Library")
-        if errors:
-            QMessageBox.warning(
-                self, "Cleanup Completed with Errors",
-                f"Removed {deleted} item(s) with {len(errors)} error(s):\n\n"
-                + "\n".join(errors[:5]),
-            )
-            self.status_message.emit(f"Cleanup done — {deleted} removed, {len(errors)} errors")
-        else:
-            QMessageBox.information(
-                self, "Cleanup Complete",
-                f"Removed {deleted} item(s) from the iPhone music library.\n\n"
-                "Connect to your Mac and toggle Music sync in Finder to rebuild "
-                "the database.",
-            )
-            self.status_message.emit(f"Cleanup complete — {deleted} item(s) removed ✓")
+    # NOTE: The previous "Clean Music Library" implementation has been
+    # removed. It recursively deleted every iTunes_Control/Music/F##
+    # folder and the iTunes sync database files (iTunesDB, iTunesCDB,
+    # iTunesControl, ...) with no orphan check at all — i.e. it was a full
+    # wipe mislabeled as safe cleanup. There is intentionally no button
+    # handler here: the card above is a disabled placeholder until real
+    # orphan-detection logic (comparing on-disk files against what the
+    # device's own metadata references) is implemented.
 
 
 class MainWindow(QMainWindow):
@@ -3105,9 +3120,12 @@ class MainWindow(QMainWindow):
         self._clear_device_ui()
 
     def _clear_device_ui(self):
-        if self._current_mount:
-            self._dev_manager.unmount_path(self._current_mount)
-            self._current_mount = None
+        # DeviceManager owns the real mount state (self._dev_manager.mount_dir);
+        # _current_mount here is just a transitional mirror of it for the UI,
+        # kept in sync at every mount/unmount site. unmount_current() is
+        # idempotent, so this is safe even if nothing is actually mounted.
+        self._dev_manager.unmount_current()
+        self._current_mount = None
         self.my_computer_tab.set_mount_point(None) if hasattr(self, "my_computer_tab") else None
         self.device_tools_tab.set_mount_point(None) if hasattr(self, "device_tools_tab") else None
         self.device_name.setText("No Device")
@@ -3222,10 +3240,84 @@ class MainWindow(QMainWindow):
         else:
             self._set_status("Refresh available on Music and Photos tabs")
 
+    # Bound on how long "Quit anyway" waits for an in-flight transfer to
+    # actually stop after being cancelled, before refusing to close rather
+    # than risk unmounting mid-write. Not a substitute for the cancellation
+    # mechanism itself — see TransferEngine.cancel()/join() — just a ceiling
+    # on how long the user waits for a well-behaved cancel to land.
+    _CLOSE_CANCEL_JOIN_TIMEOUT = 10.0
+
+    def _active_transfer_tab_names(self) -> List[str]:
+        """
+        Tabs with a TransferEngine still mid-copy, via each tab's public
+        is_transfer_active() state. Used to decide whether it's safe to
+        unmount and exit.
+        """
+        active = []
+        if self.music_tab.is_transfer_active():
+            active.append("Music")
+        if self.my_computer_tab.is_transfer_active():
+            active.append("My Computer")
+        return active
+
+    def _cancel_and_wait_for_active_transfers(self) -> bool:
+        """
+        Request cancellation on every tab's TransferEngine and wait for
+        each worker to actually stop. Returns True only if every engine
+        genuinely reached a stopped state — the caller must not proceed to
+        unmount unless this is True, since cancel() alone only requests
+        the stop and does not confirm a write already in flight has
+        actually ended.
+        """
+        engines = [self.music_tab._transfer, self.my_computer_tab._transfer]
+        for engine in engines:
+            if engine.is_running:
+                engine.cancel()
+        return all(
+            engine.join(timeout=self._CLOSE_CANCEL_JOIN_TIMEOUT)
+            for engine in engines
+        )
+
     def closeEvent(self, event):
+        active = self._active_transfer_tab_names()
+        if active:
+            reply = QMessageBox.warning(
+                self,
+                "Transfer In Progress",
+                "A file transfer is still in progress ({}).\n\n"
+                "Closing now would tear down the iPhone mount while a file "
+                "is still being written, which can leave a truncated file "
+                "on the device.\n\n"
+                "Quit anyway? MoTunes will cancel the transfer safely "
+                "first — the file being written when you confirm will not "
+                "be completed.".format(", ".join(active)),
+                QMessageBox.Cancel | QMessageBox.Yes,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+            # The user confirmed, but that is not itself permission to tear
+            # the mount out from under a write in progress — only a
+            # confirmed-stopped worker earns that. If cancellation can't be
+            # confirmed within the timeout, stay open rather than guess.
+            if not self._cancel_and_wait_for_active_transfers():
+                QMessageBox.warning(
+                    self, "Still Finishing",
+                    "MoTunes could not confirm the in-progress transfer "
+                    "stopped safely in time, so it's staying open rather "
+                    "than risk corrupting a file on your iPhone. Please "
+                    "wait a moment and try closing again.",
+                )
+                event.ignore()
+                return
+
         self._dev_manager.stop_polling()
-        if self._current_mount:
-            self._dev_manager.unmount_path(self._current_mount)
+        # DeviceManager owns the real mount state; unmount_current() is
+        # idempotent, so this is safe even if nothing is actually mounted.
+        self._dev_manager.unmount_current()
+        self._current_mount = None
         self.player_bar.cleanup()
         event.accept()
 

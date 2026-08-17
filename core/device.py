@@ -125,6 +125,12 @@ class DeviceManager:
     def __init__(self):
         self._device: Optional[DeviceInfo] = None
         self._mount_dir: Optional[str] = None
+        # Guards self._mount_dir. mount_media() can run on the Qt main
+        # thread (via MainWindow's "Mount Device" button) at the same time
+        # the poll thread's _poll_loop calls unmount_current() on a real
+        # disconnect — without this, a lost update could leave a freshly
+        # set mount_dir cleared, or a stale one still tracked as active.
+        self._mount_lock = threading.Lock()
         self._on_connected: Optional[Callable] = None
         self._on_disconnected: Optional[Callable] = None
         self._polling = False
@@ -257,7 +263,14 @@ class DeviceManager:
             return 0, 0
 
     def mount_media(self) -> Optional[str]:
-        """Mount iPhone media (Music, DCIM) via ifuse."""
+        """Mount iPhone media (Music, DCIM) via ifuse.
+
+        On success, records the mount as this manager's single tracked
+        active mount (self._mount_dir) so unmount_current()/disconnect()
+        actually have something to tear down. A failed mount never leaves
+        self._mount_dir pointing at a directory that isn't really mounted.
+        """
+        mount_dir = None
         try:
             mount_dir = tempfile.mkdtemp(prefix="motunes_media_")
             result = subprocess.run(
@@ -265,6 +278,8 @@ class DeviceManager:
                 capture_output=True, text=True, timeout=15
             )
             if result.returncode == 0:
+                with self._mount_lock:
+                    self._mount_dir = mount_dir
                 return mount_dir
             else:
                 print(f"[DeviceManager] Media mount error: {result.stderr}")
@@ -272,6 +287,11 @@ class DeviceManager:
                 return None
         except Exception as e:
             print(f"[DeviceManager] Media mount error: {e}")
+            if mount_dir and os.path.isdir(mount_dir):
+                try:
+                    os.rmdir(mount_dir)
+                except Exception:
+                    pass
             return None
 
     def storage_from_mount(self, mount_path: str) -> tuple:
@@ -288,27 +308,60 @@ class DeviceManager:
             print(f"[DeviceManager] storage_from_mount error: {e}")
             return 0, 0
 
-    def _unmount(self):
-        if self._mount_dir and os.path.exists(self._mount_dir):
-            try:
-                subprocess.run(["fusermount", "-u", self._mount_dir],
-                               capture_output=True, timeout=5)
-                os.rmdir(self._mount_dir)
-            except Exception:
-                pass
-            self._mount_dir = None
-
-    def unmount_path(self, path: str):
+    def _do_unmount(self, path: str):
+        """Best-effort fusermount + rmdir. Never raises — a path that's
+        already unmounted or already removed is not an error here."""
         try:
             subprocess.run(["fusermount", "-u", path],
                            capture_output=True, timeout=5)
+        except Exception:
+            pass
+        try:
             os.rmdir(path)
         except Exception:
             pass
 
+    def unmount_current(self):
+        """
+        Idempotent: unmount whatever this manager currently has tracked as
+        the active mount, if anything. Clears the tracked state up front
+        (under lock, so this can't race mount_media() setting a fresh
+        mount_dir concurrently — e.g. the poll thread noticing a real
+        disconnect while the main thread is mid-mount), so a second call
+        is a safe no-op rather than re-running fusermount on a stale path.
+        """
+        with self._mount_lock:
+            mount_dir = self._mount_dir
+            self._mount_dir = None
+        if mount_dir:
+            self._do_unmount(mount_dir)
+
+    def unmount_path(self, path: str):
+        """
+        Unmount an arbitrary mount path — used for stale mounts left over
+        from a previous session. If it happens to be the mount this manager
+        is currently tracking, clears that tracked state too so the two
+        never drift out of sync.
+        """
+        with self._mount_lock:
+            if path == self._mount_dir:
+                self._mount_dir = None
+        self._do_unmount(path)
+
+    def _unmount(self):
+        self.unmount_current()
+
     def disconnect(self):
-        self._unmount()
+        self.unmount_current()
         self._device = None
+
+    @property
+    def mount_dir(self) -> Optional[str]:
+        """The single source of truth for 'what is currently mounted', or
+        None if nothing is mounted. Set by mount_media() on success, cleared
+        by unmount_current()/unmount_path()/disconnect()."""
+        with self._mount_lock:
+            return self._mount_dir
 
     @property
     def device(self) -> Optional[DeviceInfo]:

@@ -4,3 +4,6 @@ __pycache__/
 
 # Superseded by README.md — kept locally for reference, not tracked
 *.docx
+
+# Local review notes / session handoffs — not for the repo
+handoffs/

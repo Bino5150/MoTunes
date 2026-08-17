@@ -70,11 +70,48 @@ class TransferEngine:
     def __init__(self):
         self._queue: List[TransferJob] = []
         self._running = False
+        self._cancel_requested = False
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
         self._on_job_start: Optional[Callable] = None
         self._on_job_progress: Optional[Callable] = None
         self._on_job_complete: Optional[Callable] = None
         self._on_all_complete: Optional[Callable] = None
         self._chunk_size = 1024 * 512  # 512KB chunks
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._running
+
+    def cancel(self):
+        """
+        Request the running worker to stop. Cooperative, not preemptive:
+        the worker notices this between chunks of the file it's currently
+        copying (worst case one chunk's I/O time later) and between jobs,
+        cleans up the partial destination file for whatever job it was
+        mid-copy on, and marks it FAILED rather than leaving a truncated
+        file behind. Does not block — call join() to wait for the worker
+        to actually stop before doing anything that assumes it has (like
+        unmounting the filesystem it's writing to/reading from).
+        """
+        with self._lock:
+            self._cancel_requested = True
+
+    def join(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait for the worker thread to actually stop. Returns True if it's
+        stopped (or there was never one running) within timeout, False if
+        it's still alive when the timeout elapses. Callers that need to be
+        sure no write is still in flight (e.g. before unmounting) must
+        check this return value — cancel() alone only requests the stop,
+        it doesn't confirm it happened.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def set_callbacks(
         self,
@@ -98,7 +135,8 @@ class TransferEngine:
             file_size_bytes=size,
             direction=direction,
         )
-        self._queue.append(job)
+        with self._lock:
+            self._queue.append(job)
         return job
 
     def add_jobs(self, sources: List[str], dest_dir: str, direction: TransferDirection):
@@ -126,19 +164,47 @@ class TransferEngine:
             self.add_job(track.path, dest, TransferDirection.FROM_DEVICE)
 
     def start(self):
-        if self._running:
-            return
-        thread = threading.Thread(target=self._run, daemon=True)
+        """
+        Begin draining the queue in a background thread.
+        A no-op if a worker is already running — safe to call repeatedly
+        (e.g. from a UI button) without ever spawning a second worker.
+        """
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            # A cancel() from a previous batch (e.g. one that was already
+            # idle when cancelled) must not immediately kill this new run.
+            self._cancel_requested = False
+            thread = threading.Thread(target=self._run, daemon=True)
+            self._thread = thread
         thread.start()
 
+    def _next_queued_job(self) -> Optional[TransferJob]:
+        """
+        Pull the next QUEUED job under lock, unless a cancellation is
+        pending — in which case stop handing out new jobs entirely rather
+        than starting one only to abort it immediately. Jobs added via
+        add_job/add_jobs while a worker is already draining the queue are
+        picked up here too, so a second start() call is never needed to
+        process them.
+        """
+        with self._lock:
+            if self._cancel_requested:
+                return None
+            for job in self._queue:
+                if job.status == TransferStatus.QUEUED:
+                    return job
+        return None
+
     def _run(self):
-        self._running = True
-        for job in self._queue:
-            if job.status != TransferStatus.QUEUED:
-                continue
+        while True:
+            job = self._next_queued_job()
+            if job is None:
+                break
             self._execute_job(job)
-        self._running = False
-        self._queue.clear()
+        with self._lock:
+            self._running = False
         if self._on_all_complete:
             self._on_all_complete()
 
@@ -161,10 +227,19 @@ class TransferEngine:
                         self._on_job_complete(job)
                     return
 
-            # Copy with progress
+            # Copy with progress. Checked once per chunk (worst case one
+            # chunk's I/O time before a cancel() is noticed) rather than
+            # only between whole files — a multi-hundred-MB file must not
+            # be able to hold up a requested cancellation indefinitely.
             src_stat = os.stat(job.source)
+            cancelled = False
             with open(job.source, "rb") as src_f, open(job.destination, "wb") as dst_f:
                 while True:
+                    with self._lock:
+                        if self._cancel_requested:
+                            cancelled = True
+                    if cancelled:
+                        break
                     chunk = src_f.read(self._chunk_size)
                     if not chunk:
                         break
@@ -172,6 +247,21 @@ class TransferEngine:
                     job.bytes_transferred += len(chunk)
                     if self._on_job_progress:
                         self._on_job_progress(job)
+
+            if cancelled:
+                # A truncated file left behind (on the device, for a
+                # TO_DEVICE job) is worse than no file at all — this job
+                # owns job.destination exclusively (just opened it in "wb"
+                # truncate mode above), so removing it here is safe.
+                try:
+                    os.remove(job.destination)
+                except Exception:
+                    pass
+                job.status = TransferStatus.FAILED
+                job.error = "Cancelled"
+                if self._on_job_complete:
+                    self._on_job_complete(job)
+                return
 
             # Preserve original timestamps so exported files retain their "date taken"
             # instead of showing the export time (ifuse doesn't expose real mtimes on copy)
@@ -191,12 +281,21 @@ class TransferEngine:
             self._on_job_complete(job)
 
     def clear(self):
-        self._queue = [j for j in self._queue if j.status == TransferStatus.IN_PROGRESS]
+        """
+        Drop queued/completed/failed/skipped jobs; preserve anything actively
+        mid-copy. Safe to call while a worker is running — it only ever
+        reassigns the queue reference under lock, so the worker's own
+        completion never races this and silently wipes a freshly queued batch.
+        """
+        with self._lock:
+            self._queue = [j for j in self._queue if j.status == TransferStatus.IN_PROGRESS]
 
     @property
     def queued_count(self) -> int:
-        return sum(1 for j in self._queue if j.status == TransferStatus.QUEUED)
+        with self._lock:
+            return sum(1 for j in self._queue if j.status == TransferStatus.QUEUED)
 
     @property
     def queue(self) -> List[TransferJob]:
-        return self._queue
+        with self._lock:
+            return list(self._queue)
