@@ -27,9 +27,9 @@ from PySide6.QtGui import (
 
 try:
     import vlc as _vlc
-    HAS_VLC = True
+    HAS_VLC_BINDINGS = True
 except ImportError:
-    HAS_VLC = False
+    HAS_VLC_BINDINGS = False
 
 # Add parent dir to path so we can import core modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2384,6 +2384,31 @@ class MyComputerTab(QWidget):
         self.status_message.emit("Transfer complete! Files sent to iPhone.")
 
 
+def _make_vlc_player():
+    """
+    Construct a VLC MediaPlayer, or None if playback isn't actually usable.
+
+    HAS_VLC_BINDINGS only means `import vlc` succeeded — python-vlc is a
+    ctypes wrapper that imports fine even when the native libvlc runtime
+    isn't installed; it only touches the native library lazily, the first
+    time a bound function is actually called. That first call is
+    _vlc.MediaPlayer() here, and a missing runtime surfaces as a NameError
+    (python-vlc's own lazy-binding lookup failing — confirmed in CI on a
+    box with the pip package but no system VLC install) or an OSError
+    (the underlying ctypes/dlopen library load failing directly). Either
+    way, treat it exactly like VLC not being installed at all: playback
+    unavailable, nothing else about the app should be affected.
+    """
+    if not HAS_VLC_BINDINGS:
+        return None
+    try:
+        return _vlc.MediaPlayer()
+    except (NameError, OSError) as e:
+        print(f"[PlayerBar] python-vlc is installed but the native VLC "
+              f"runtime isn't usable — playback disabled ({e})")
+        return None
+
+
 class PlayerBar(QWidget):
     """
     Persistent player bar docked at the bottom of the content area.
@@ -2392,7 +2417,7 @@ class PlayerBar(QWidget):
     """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._player = _vlc.MediaPlayer() if HAS_VLC else None
+        self._player = _make_vlc_player()
         self._playlist: List[Track] = []
         self._current_index = -1
         self._duration_ms = 0
