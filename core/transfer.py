@@ -180,31 +180,39 @@ class TransferEngine:
             self._thread = thread
         thread.start()
 
-    def _next_queued_job(self) -> Optional[TransferJob]:
+    def _next_job_or_stop(self) -> Optional[TransferJob]:
         """
-        Pull the next QUEUED job under lock, unless a cancellation is
-        pending — in which case stop handing out new jobs entirely rather
-        than starting one only to abort it immediately. Jobs added via
-        add_job/add_jobs while a worker is already draining the queue are
-        picked up here too, so a second start() call is never needed to
-        process them.
+        Pull the next QUEUED job, or decide the worker is done — as a
+        single atomic operation under the lock. Finding "nothing left to
+        do" and flipping self._running to False must happen in the same
+        critical section: if they were two separate lock acquisitions (as
+        they used to be), a job queued by another thread in the gap
+        between them would be silently stranded — start() would see
+        self._running still True and no-op, trusting this worker to pick
+        the job up, but this worker had already committed to stopping
+        without re-checking the queue. With the check and the flag flip
+        atomic, there are only two possible outcomes: the job was added
+        before this decision (this loop iteration finds and processes it),
+        or after (self._running is already False by the time add_job()'s
+        caller can call start() again, so a fresh worker gets spawned).
+
+        Cancellation is treated the same way — a pending cancel() also
+        ends the run, atomically with the same flag flip.
         """
         with self._lock:
-            if self._cancel_requested:
-                return None
-            for job in self._queue:
-                if job.status == TransferStatus.QUEUED:
-                    return job
-        return None
+            if not self._cancel_requested:
+                for job in self._queue:
+                    if job.status == TransferStatus.QUEUED:
+                        return job
+            self._running = False
+            return None
 
     def _run(self):
         while True:
-            job = self._next_queued_job()
+            job = self._next_job_or_stop()
             if job is None:
                 break
             self._execute_job(job)
-        with self._lock:
-            self._running = False
         if self._on_all_complete:
             self._on_all_complete()
 

@@ -167,3 +167,94 @@ def test_clear_preserves_in_progress_job(tmp_path):
 
     proceed.set()
     assert _wait_until(lambda: not engine.is_running)
+
+
+class _PausedScanList(list):
+    """
+    A list whose iteration pauses at a controlled checkpoint. Used to widen
+    the window during which TransferEngine's lock is held while scanning
+    for a queued job, so a concurrent add_job()+start() attempt can be
+    proven to genuinely block on that same lock until the scan — and the
+    _running flag flip that must happen atomically with it — completes.
+    """
+
+    def __init__(self, *args, entered_scan=None, resume_scan=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._entered_scan = entered_scan
+        self._resume_scan = resume_scan
+
+    def __iter__(self):
+        if self._entered_scan is not None:
+            self._entered_scan.set()
+        if self._resume_scan is not None:
+            self._resume_scan.wait(timeout=5)
+        return super().__iter__()
+
+
+def test_terminal_drain_decision_is_atomic_with_running_flag(tmp_path):
+    """
+    Regression test for a drain-boundary TOCTOU: _next_job_or_stop() must
+    decide "no more work, stop" and flip self._running to False as a
+    single atomic operation under the lock. If those were two separate
+    critical sections, a job added (and start() called) in the gap
+    between them would be silently stranded: start() would see
+    self._running still True and no-op, trusting the existing worker to
+    pick the job up — but that worker had already committed to stopping
+    without re-checking the queue.
+
+    Proven directly against the real production lock: while the worker is
+    deliberately paused mid-scan (holding self._lock the whole time), a
+    concurrent add_job()+start() attempt must be unable to complete until
+    the scan resumes — which is only possible if the scan and the
+    self._running flip share one lock acquisition, not two.
+    """
+    engine = TransferEngine()
+    entered_scan = threading.Event()
+    resume_scan = threading.Event()
+    engine._queue = _PausedScanList(entered_scan=entered_scan, resume_scan=resume_scan)
+
+    engine.start()  # empty queue — the worker's first scan finds nothing and pauses there
+
+    assert entered_scan.wait(timeout=5), "worker never reached the terminal scan"
+
+    add_and_start_done = threading.Event()
+
+    def add_and_start_late_job():
+        src = tmp_path / "late.bin"
+        src.write_bytes(b"y" * 16)
+        engine.add_job(str(src), str(tmp_path / "out" / "late.bin"), TransferDirection.FROM_DEVICE)
+        engine.start()
+        add_and_start_done.set()
+
+    racer = threading.Thread(target=add_and_start_late_job)
+    racer.start()
+
+    # The racer must NOT be able to complete add_job()+start() while the
+    # worker is still mid-scan — if it can, the scan and the _running flip
+    # aren't actually atomic, and the old stranding bug is back.
+    assert not add_and_start_done.wait(timeout=0.3), (
+        "add_job()/start() completed while the worker was still mid-scan — "
+        "the terminal drain decision and the _running flip are not atomic"
+    )
+
+    resume_scan.set()  # let the worker finish its (empty) scan and flip _running
+
+    assert add_and_start_done.wait(timeout=5), "racer never got to run after the scan completed"
+    racer.join(timeout=5)
+
+    # A second worker run (for the late job, picked up by the racer's own
+    # start() call) fires on_all_complete independently of the first
+    # (empty) run — poll the actual job state rather than a single
+    # completion signal, so this isn't sensitive to which run's callback
+    # happens to land first.
+    def _late_job_finished():
+        jobs = engine.queue
+        return len(jobs) == 1 and jobs[0].status != TransferStatus.QUEUED and jobs[0].status != TransferStatus.IN_PROGRESS
+
+    assert _wait_until(_late_job_finished, timeout=5), "the late-queued job never reached a terminal state"
+
+    jobs = engine.queue
+    assert jobs[0].filename == "late.bin"
+    assert jobs[0].status == TransferStatus.COMPLETE, (
+        "the late-queued job was stranded instead of being picked up by a fresh worker"
+    )
