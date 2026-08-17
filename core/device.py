@@ -133,28 +133,82 @@ class DeviceManager:
         self._mount_lock = threading.Lock()
         self._on_connected: Optional[Callable] = None
         self._on_disconnected: Optional[Callable] = None
-        self._polling = False
+        # Guards _poll_thread so start_polling() can't spawn a second
+        # concurrent worker, and so stop_polling() reads a consistent
+        # thread reference. Never held across thread.join().
+        self._poll_lock = threading.Lock()
         self._poll_thread: Optional[threading.Thread] = None
+        self._poll_interval = 3.0
+        # Set by stop_polling() to end the loop; cleared by start_polling()
+        # for a fresh run. A real synchronization primitive rather than a
+        # shared bool + time.sleep(): stop_polling() can wake a sleeping
+        # poll iteration immediately instead of waiting out the rest of
+        # the interval, and — critically — can confirm via thread.join()
+        # that the worker has actually exited before returning, rather
+        # than a caller having to assume that setting a flag "eventually"
+        # means stopped. That gap (poll thread still alive and later
+        # calling back into a bridge/QObject whose MainWindow has already
+        # started tearing down) is what produced the segfault CI caught.
+        self._stop_event = threading.Event()
 
     def set_callbacks(self, on_connected: Callable, on_disconnected: Callable):
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
 
-    def start_polling(self, interval: float = 3.0):
-        self._polling = True
-        self._poll_interval = interval
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True
-        )
-        self._poll_thread.start()
+    @property
+    def is_polling(self) -> bool:
+        """True if a poll worker is currently alive."""
+        with self._poll_lock:
+            thread = self._poll_thread
+        return thread is not None and thread.is_alive()
 
-    def stop_polling(self):
-        self._polling = False
+    def start_polling(self, interval: float = 3.0):
+        """
+        Begin polling for device connect/disconnect in a background
+        thread. Idempotent: a no-op if a poll worker is already running —
+        never spawns a second concurrent poller.
+        """
+        with self._poll_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                return
+            self._poll_interval = interval
+            self._stop_event.clear()
+            thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._poll_thread = thread
+        thread.start()
+
+    def stop_polling(self, timeout: float = 10.0) -> bool:
+        """
+        Request the poll worker to stop and wait for it to actually
+        terminate before returning. Returns True once confirmed stopped
+        (or if no worker was running), False if it didn't stop within
+        `timeout` — callers on a shutdown path should treat False as "do
+        not assume it is safe to tear down anything the worker might
+        still call back into."
+
+        `timeout` defaults generously above the worst realistic single
+        poll iteration (a handful of subprocess calls to idevice_id /
+        ideviceinfo, each with its own 5s timeout) rather than being an
+        arbitrary guess — the interruptible wait below means the common
+        case returns almost immediately regardless.
+        """
+        self._stop_event.set()
+        with self._poll_lock:
+            thread = self._poll_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            # A callback invoked from the poll thread itself calling back
+            # into stop_polling() can't wait for its own thread to end —
+            # Thread.join() would raise RuntimeError for exactly this.
+            # Report "not confirmed" rather than let that propagate.
+            return False
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def _poll_loop(self):
-        import time
         was_connected = False
-        while self._polling:
+        while not self._stop_event.is_set():
             try:
                 udid = self._get_udid()
                 is_connected = udid is not None
@@ -172,7 +226,11 @@ class DeviceManager:
                 was_connected = is_connected
             except Exception as e:
                 print(f"[DeviceManager] Poll error: {e}")
-            time.sleep(self._poll_interval)
+            # Interruptible wait: stop_polling() setting the event wakes
+            # this immediately instead of sleeping out the rest of the
+            # interval, so a stop request is never left waiting behind an
+            # in-progress sleep.
+            self._stop_event.wait(timeout=self._poll_interval)
 
     def _get_udid(self) -> Optional[str]:
         try:

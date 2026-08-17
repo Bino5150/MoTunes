@@ -3338,7 +3338,25 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-        self._dev_manager.stop_polling()
+        if not self._dev_manager.stop_polling():
+            # Same principle as the transfer-cancel gate above: unconfirmed
+            # worker termination does not earn teardown permission. If we
+            # can't prove the device-monitor thread actually stopped,
+            # unmounting or tearing down PlayerBar risks it calling back
+            # into Qt objects mid-teardown — the exact segfault CI caught.
+            # No "quit anyway" override here; the stop request has already
+            # been made (the poll thread is on its way out), so simply
+            # trying to close again shortly should succeed.
+            QMessageBox.warning(
+                self, "Still Stopping",
+                "MoTunes could not confirm the device-monitor worker "
+                "stopped safely yet, so it's staying open rather than "
+                "risk a crash. Please wait a moment and try closing "
+                "again.",
+            )
+            event.ignore()
+            return
+
         # DeviceManager owns the real mount state; unmount_current() is
         # idempotent, so this is safe even if nothing is actually mounted.
         self._dev_manager.unmount_current()
