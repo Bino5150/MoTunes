@@ -1,0 +1,5 @@
+PySide6>=6.5
+eyeD3>=0.9
+mutagen>=1.47
+Pillow>=10.0
+python-vlc  # optional — enables in-app music playback via VLC if installed

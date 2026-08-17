@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.bk
+
+# Superseded by README.md — kept locally for reference, not tracked
+*.docx
