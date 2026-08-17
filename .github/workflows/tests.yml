@@ -35,6 +35,23 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements-dev.txt
 
+      # Confirmed necessary by an actual CI failure (run #1, job
+      # pytest (Ubuntu, Python 3.12), step "Python syntax / import
+      # validation"): `from PySide6.QtWidgets import (...)` failed with
+      # `ImportError: libEGL.so.1: cannot open shared object file`.
+      # ubuntu-latest doesn't ship the Qt6 graphics runtime by default.
+      # These five are the OS-level libraries `ldd` shows the installed
+      # PySide6 wheel's Qt6 core/offscreen-plugin libraries link against
+      # that aren't already guaranteed present on a minimal runner — not a
+      # speculative list. QT_QPA_PLATFORM=offscreen still needs them: Qt6's
+      # core libraries (libQt6Gui, in particular) resolve these at load
+      # time, before any platform plugin or display is even selected.
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
