@@ -87,3 +87,11 @@ python3 motunes.py
 
 - `motunes_diag.py` — inspect what the music scanner sees on a mounted device
 - `storage_diag.py` — dump raw device storage keys from `ideviceinfo`
+
+## Development
+
+Install the development dependencies and run the test suite:
+
+pip install -r requirements-dev.txt
+
+QT_QPA_PLATFORM=offscreen python -m pytest tests/ -v
