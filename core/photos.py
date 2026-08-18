@@ -416,12 +416,18 @@ class PhotoDeleteWorker:
     before unmounting) uses is_running / join().
     """
 
-    def __init__(self):
+    def __init__(self, can_write: Optional[Callable[[], bool]] = None):
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._on_result: Optional[Callable] = None        # (DeleteResult) -> None, per unit
         self._on_all_complete: Optional[Callable] = None  # () -> None
+        # Consulted before spawning the worker — a caller invoking
+        # start() directly must still be refused if device writes are
+        # currently prohibited, not just a UI button that queued it.
+        # Defaults to always-allowed so existing/other callers that
+        # don't care about write policy see no behavior change.
+        self._can_write: Callable[[], bool] = can_write or (lambda: True)
 
     def set_callbacks(self, on_result: Optional[Callable] = None,
                        on_all_complete: Optional[Callable] = None):
@@ -436,7 +442,11 @@ class PhotoDeleteWorker:
     def start(self, units: List[DeleteUnit]) -> bool:
         """Begin deleting `units` in a background thread. Returns False
         (no-op) if a batch is already running — never runs two concurrent
-        delete workers."""
+        delete workers — or if device writes are currently prohibited by
+        capability policy, in which case no thread is spawned and zero
+        os.remove() calls happen."""
+        if not self._can_write():
+            return False
         with self._lock:
             if self._running:
                 return False

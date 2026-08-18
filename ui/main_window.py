@@ -7,7 +7,7 @@ import sys
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -40,6 +40,23 @@ from core.photos import (
     find_live_photo_companion,
 )
 from core.transfer import TransferEngine, TransferDirection, TransferStatus
+from core.capability import CapabilityDecision, RuntimeCapability, WritePolicy
+
+
+# Default capability for tabs that haven't had a real DeviceManager wired
+# in yet (construction time, and every existing test that builds a tab
+# directly with no MainWindow around it). Permissive by design — these
+# tabs' write paths are inert until a mount actually exists, so this
+# default only matters for tests/tools exercising a tab in isolation and
+# must not change behavior that predates this capability system.
+_PERMISSIVE_CAPABILITY = CapabilityDecision(
+    capability=RuntimeCapability(
+        ifuse_present=True, ifuse_version=(1, 2, 1), ifuse_version_raw="ifuse 1.2.1",
+        idevice_id_present=True, ideviceinfo_present=True, unmount_binary="fusermount3",
+    ),
+    write_policy=WritePolicy.WRITE_ENABLED,
+    reason="No capability provider wired — defaulting to write-enabled.",
+)
 
 
 # ── Color Palette ─────────────────────────────────────────────────────────────
@@ -445,12 +462,17 @@ class TagEditorDialog(QDialog):
     Writes directly to the file on the mounted iPhone.
     """
 
-    def __init__(self, track: "Track", parent=None):
+    def __init__(self, track: "Track", parent=None, can_write: Optional[Callable[[], bool]] = None):
         super().__init__(parent)
         self._track = track
         self._new_artwork_data: Optional[bytes] = None
         self._new_artwork_path: Optional[str] = None
         self._saved = False
+        # Checked in _save(), not just by the caller that opened this
+        # dialog — constructing and driving a TagEditorDialog directly
+        # must still be refused when device writes are prohibited.
+        # Defaults to always-allowed for standalone/test construction.
+        self._can_write: Callable[[], bool] = can_write or (lambda: True)
 
         self.setWindowTitle("Edit Tags")
         self.setMinimumWidth(620)
@@ -664,6 +686,13 @@ class TagEditorDialog(QDialog):
         self._display_artwork(None)
 
     def _save(self):
+        if not self._can_write():
+            QMessageBox.warning(
+                self, "Writes Disabled",
+                "Device writes are currently disabled by MoTunes' capability "
+                "policy (see Device Tools for why). Tag changes were not saved."
+            )
+            return
         fpath = self._track.path
         ext = Path(fpath).suffix.lower()
         try:
@@ -785,7 +814,14 @@ class MusicTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scanner = MusicScanner()
-        self._transfer = TransferEngine()
+        # Defaults to write-enabled until MainWindow wires the real
+        # DeviceManager in via set_capability_provider() — see that
+        # method's docstring. The predicate closures below read
+        # self._capability_provider dynamically (not captured at
+        # TransferEngine-construction time), so swapping the provider
+        # later takes effect immediately without rebuilding the engine.
+        self._capability_provider: Callable[[], CapabilityDecision] = lambda: _PERMISSIVE_CAPABILITY
+        self._transfer = TransferEngine(can_write=lambda: self._capability_provider().can_write)
         self._mount_point: Optional[str] = None
 
         # _all_tracks is the full master list, indexed the same way the
@@ -901,6 +937,16 @@ class MusicTab(QWidget):
     def set_player(self, player):
         self._player = player
 
+    def set_capability_provider(self, provider: Callable[[], CapabilityDecision]):
+        """
+        Wire in the live capability decision (MainWindow calls this once,
+        pointing at self._dev_manager.capability). Every write-gated
+        entry point in this tab reads through self._capability_provider,
+        so this takes effect immediately for anything checked after this
+        call — no need to reconstruct the transfer engine.
+        """
+        self._capability_provider = provider
+
     def _track_at_row(self, row: int) -> Optional[Track]:
         """
         Resolve the track for a table row against what's actually displayed
@@ -979,7 +1025,10 @@ class MusicTab(QWidget):
                 "Track metadata is still loading. Please wait a moment and try again."
             )
             return
-        dlg = TagEditorDialog(track, parent=self)
+        dlg = TagEditorDialog(
+            track, parent=self,
+            can_write=lambda: self._capability_provider().can_write,
+        )
         if dlg.exec() == QDialog.Accepted and dlg.saved:
             # Refresh this row's text and artwork
             updates = {1: track.display_title, 2: track.display_artist,
@@ -1221,6 +1270,10 @@ class MusicTab(QWidget):
     def _add_tracks(self):
         if not self._mount_point:
             QMessageBox.warning(self, "Not Connected", "Connect an iPhone first.")
+            return
+        decision = self._capability_provider()
+        if not decision.can_write:
+            self.status_message.emit(f"Cannot send to iPhone — {decision.reason}")
             return
 
         vlc_path = find_vlc_iphone_path(self._mount_point)
@@ -1642,6 +1695,11 @@ class PhotosTab(QWidget):
         self._scanner = PhotoScanner()
         self._all_media: List[Photo] = []
         self._mount_point: Optional[str] = None
+        # Defaults to write-enabled until MainWindow wires the real
+        # DeviceManager in via set_capability_provider(). Read dynamically
+        # by the predicates below, so swapping the provider later takes
+        # effect immediately without rebuilding the engine/worker.
+        self._capability_provider: Callable[[], CapabilityDecision] = lambda: _PERMISSIVE_CAPABILITY
 
         # Bridge: scanner background thread → main thread via Qt signals
         self._bridge = _PhotoBridge()
@@ -1656,7 +1714,7 @@ class PhotosTab(QWidget):
         # TransferEngine(). Same Qt signal-bridge pattern as Music/My
         # Computer: TransferEngine's callbacks run on its worker thread,
         # so they're wired to bridge signal emitters, never called directly.
-        self._transfer = TransferEngine()
+        self._transfer = TransferEngine(can_write=lambda: self._capability_provider().can_write)
         self._transfer_bridge = _TransferBridge()
         self._transfer_bridge.job_progress.connect(self._on_transfer_progress)
         self._transfer_bridge.all_complete.connect(self._on_transfer_complete)
@@ -1669,7 +1727,7 @@ class PhotosTab(QWidget):
         # transfer engine. A single os.remove() can't be safely preempted
         # mid-operation like a chunked copy, so this has no cancel(); see
         # PhotoDeleteWorker's docstring.
-        self._delete_worker = PhotoDeleteWorker()
+        self._delete_worker = PhotoDeleteWorker(can_write=lambda: self._capability_provider().can_write)
         self._delete_bridge = _PhotoDeleteBridge()
         self._delete_bridge.result.connect(self._on_delete_result)
         self._delete_bridge.all_complete.connect(self._on_delete_all_complete)
@@ -1858,11 +1916,13 @@ class PhotosTab(QWidget):
     def _on_selection_changed(self, count: int):
         if count:
             self.sel_label.setText(f"{count} selected")
-            # Selecting a different item mid-operation must not silently
-            # re-enable a button an active export/delete just disabled.
+            # Selecting a different item mid-operation (or while writes
+            # are policy-disabled) must not silently re-enable a button
+            # that state disabled.
             active = self.is_media_operation_active()
+            can_write = self._capability_provider().can_write
             self.export_sel_btn.setEnabled(not active)
-            self.delete_btn.setEnabled(not active)
+            self.delete_btn.setEnabled(not active and can_write)
         else:
             self.sel_label.setText("")
             self.export_sel_btn.setEnabled(False)
@@ -1990,16 +2050,31 @@ class PhotosTab(QWidget):
             return "A delete is already in progress — please wait for it to finish."
         return "A media operation is already in progress — please wait for it to finish."
 
+    def set_capability_provider(self, provider: Callable[[], CapabilityDecision]):
+        """
+        Wire in the live capability decision (MainWindow calls this once,
+        pointing at self._dev_manager.capability). Every write-gated
+        entry point in this tab reads through self._capability_provider,
+        so this takes effect immediately for anything checked after this
+        call — no need to reconstruct the transfer engine/delete worker.
+        """
+        self._capability_provider = provider
+
     def _set_media_controls_enabled(self, enabled: bool):
         """
         Enable/disable every control that starts an export or delete
         together. Export and delete are mutually exclusive, so starting
         either must visibly disable both — not just the one that started.
+        Delete additionally requires write capability — export (a read
+        from the device) does not, so it isn't gated here. This is a UX
+        convenience only; _delete_selected() enforces the same policy
+        independently, since a disabled button is not the safety boundary.
         """
         has_selection = len(self._current_grid().selected_photos) > 0
+        can_write = self._capability_provider().can_write
         self.export_all_btn.setEnabled(enabled)
         self.export_sel_btn.setEnabled(enabled and has_selection)
-        self.delete_btn.setEnabled(enabled and has_selection)
+        self.delete_btn.setEnabled(enabled and has_selection and can_write)
 
     # ── Export ────────────────────────────────────────────────────────────────
 
@@ -2093,6 +2168,10 @@ class PhotosTab(QWidget):
     def _delete_selected(self):
         if self.is_media_operation_active():
             self.status_message.emit(self._media_operation_busy_message())
+            return
+        decision = self._capability_provider()
+        if not decision.can_write:
+            self.status_message.emit(f"Cannot delete from iPhone — {decision.reason}")
             return
 
         grid = self._current_grid()
@@ -2204,6 +2283,11 @@ class MyComputerTab(QWidget):
         super().__init__(parent)
         self._current_path = os.path.expanduser("~/Music")
         self._mount_point: Optional[str] = None
+        # Defaults to write-enabled until MainWindow wires the real
+        # DeviceManager in via set_capability_provider(). Read dynamically
+        # by the predicate below, so swapping the provider later takes
+        # effect immediately without rebuilding the transfer engine.
+        self._capability_provider: Callable[[], CapabilityDecision] = lambda: _PERMISSIVE_CAPABILITY
 
         # Bridge: TransferEngine worker thread → main thread via Qt signals
         # (see _TransferBridge docstring — QTimer.singleShot from that
@@ -2221,6 +2305,14 @@ class MyComputerTab(QWidget):
 
     def set_player(self, player):
         self._player = player
+
+    def set_capability_provider(self, provider: Callable[[], CapabilityDecision]):
+        """
+        Wire in the live capability decision (MainWindow calls this once,
+        pointing at self._dev_manager.capability). Takes effect
+        immediately for anything checked after this call.
+        """
+        self._capability_provider = provider
 
     def set_mount_point(self, mount_point: Optional[str]):
         self._mount_point = mount_point
@@ -2359,7 +2451,7 @@ class MyComputerTab(QWidget):
 
         # Transfer engine — callbacks run on its background worker thread,
         # so they're wired to bridge signal emitters, not the slots directly.
-        self._transfer = TransferEngine()
+        self._transfer = TransferEngine(can_write=lambda: self._capability_provider().can_write)
         self._transfer.set_callbacks(
             on_job_progress=self._transfer_bridge.job_progress.emit,
             on_all_complete=self._transfer_bridge.all_complete.emit,
@@ -2511,6 +2603,7 @@ class MyComputerTab(QWidget):
         )
         self.transfer_btn.setEnabled(
             has_audio and self._mount_point is not None
+            and self._capability_provider().can_write
         )
 
     # ── Transfer ──────────────────────────────────────────────────────────────
@@ -2519,6 +2612,10 @@ class MyComputerTab(QWidget):
         if not self._mount_point:
             QMessageBox.warning(self, "Not Mounted",
                                 "Mount your iPhone first.")
+            return
+        decision = self._capability_provider()
+        if not decision.can_write:
+            self.status_message.emit(f"Cannot send to iPhone — {decision.reason}")
             return
 
         rows = list(set(
@@ -3091,21 +3188,29 @@ class MainWindow(QMainWindow):
         self._dev_manager = DeviceManager()
         self._current_mount: Optional[str] = None
 
+        # Known before any mount/write is allowed, per capability policy —
+        # probed once here at startup so the UI can reflect it before the
+        # user ever clicks "Mount Device"; mount_media() re-probes fresh
+        # again immediately before it actually shells out to ifuse. Never
+        # re-probed from the poll loop — that stays a cheap connect/
+        # disconnect check, not a dependency-diagnostics benchmark.
+        startup_capability = self._dev_manager.refresh_capability()
+
         self._cleanup_stale_mounts()
         self._setup_ui()
+        self._apply_capability_to_ui(startup_capability)
         self._start_device_polling()
 
     def _cleanup_stale_mounts(self):
-        """Unmount any leftover motunes mount points from previous sessions."""
+        """Unmount any leftover motunes mount points from previous sessions.
+        Routed through DeviceManager's own unmount path (fusermount3/
+        fusermount fallback included) rather than a second, independent
+        raw subprocess call — one place owns "how MoTunes unmounts"."""
         import glob
         for path in glob.glob("/tmp/motunes_media_*"):
-            try:
-                subprocess.run(["fusermount", "-u", path],
-                               capture_output=True, timeout=5)
-                os.rmdir(path)
+            self._dev_manager.unmount_path(path)
+            if not os.path.isdir(path):
                 print(f"[MoTunes] Cleaned stale mount: {path}")
-            except Exception:
-                pass
 
     def _setup_ui(self):
         central = QWidget()
@@ -3163,12 +3268,24 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self._mount_device)
         self.connect_btn.setEnabled(False)
 
+        # Capability banner — hidden for a normal/compatible environment,
+        # shown only when there's something the user actually needs to
+        # know (read-only, blocked, missing dependency). Not a modal: the
+        # goal is "visible if relevant", not "interrupt startup".
+        self.capability_label = QLabel("")
+        self.capability_label.setStyleSheet(
+            f"color: {WARNING}; font-size: 10px; background: transparent; border: none;"
+        )
+        self.capability_label.setWordWrap(True)
+        self.capability_label.hide()
+
         dc_layout.addWidget(self.device_icon)
         dc_layout.addWidget(self.device_name)
         dc_layout.addWidget(self.device_ios)
         dc_layout.addWidget(self.storage_bar)
         dc_layout.addWidget(self.storage_info)
         dc_layout.addWidget(self.connect_btn)
+        dc_layout.addWidget(self.capability_label)
 
         sidebar_layout.addWidget(self.device_card)
 
@@ -3254,14 +3371,17 @@ class MainWindow(QMainWindow):
 
         self.music_tab = MusicTab()
         self.music_tab.status_message.connect(self._set_status)
+        self.music_tab.set_capability_provider(lambda: self._dev_manager.capability)
         self.tabs.addTab(self.music_tab, "Music")
 
         self.photos_tab = PhotosTab()
         self.photos_tab.status_message.connect(self._set_status)
+        self.photos_tab.set_capability_provider(lambda: self._dev_manager.capability)
         self.tabs.addTab(self.photos_tab, "Photos")
 
         self.my_computer_tab = MyComputerTab()
         self.my_computer_tab.status_message.connect(self._set_status)
+        self.my_computer_tab.set_capability_provider(lambda: self._dev_manager.capability)
         self.tabs.addTab(self.my_computer_tab, "My Computer")
 
         # Playlists — styled coming soon card
@@ -3362,6 +3482,10 @@ class MainWindow(QMainWindow):
         self._set_status("Mounting iPhone filesystem...")
 
         mount = self._dev_manager.mount_media()
+        # mount_media() re-probed capability immediately before attempting
+        # the ifuse call — reflect that fresh result now, not just the
+        # startup-time reading.
+        self._apply_capability_to_ui(self._dev_manager.capability)
         if mount:
             self._current_mount = mount
             device.mount_point = mount
@@ -3385,13 +3509,40 @@ class MainWindow(QMainWindow):
         else:
             self.connect_btn.setEnabled(True)
             self.connect_btn.setText("Mount Device")
-            QMessageBox.warning(
-                self, "Mount Failed",
-                "Could not mount the iPhone.\n\n"
-                "Make sure you have tapped 'Trust' on your iPhone when prompted, "
-                "and that ifuse is installed.\n\n"
-                "Try: sudo apt install ifuse"
-            )
+            decision = self._dev_manager.capability
+            if not decision.can_mount:
+                # Refused by capability policy before ifuse was ever
+                # invoked — tell the user the real reason, not a generic
+                # "trust your phone" message that doesn't apply here.
+                QMessageBox.warning(self, "Mount Unavailable", decision.reason)
+            else:
+                QMessageBox.warning(
+                    self, "Mount Failed",
+                    "Could not mount the iPhone.\n\n"
+                    "Make sure you have tapped 'Trust' on your iPhone when prompted, "
+                    "and that ifuse is installed.\n\n"
+                    "Try: sudo apt install ifuse"
+                )
+
+    def _apply_capability_to_ui(self, decision: CapabilityDecision):
+        """
+        Reflect the current capability decision in the sidebar without
+        turning startup into a wall of modal dialogs: a normal/compatible
+        environment shows nothing extra, everything else gets a concise,
+        visible reason. This is the only place that translates a
+        CapabilityDecision into UI text — tabs consume the decision
+        object itself, never re-deriving version logic of their own.
+        """
+        if decision.write_policy == WritePolicy.WRITE_ENABLED:
+            self.capability_label.hide()
+            return
+        prefix = "⛔" if not decision.can_mount else "🔒"
+        self.capability_label.setText(f"{prefix} {decision.reason}")
+        self.capability_label.setStyleSheet(
+            f"color: {DANGER if not decision.can_mount else WARNING}; "
+            f"font-size: 10px; background: transparent; border: none;"
+        )
+        self.capability_label.show()
 
     def _make_coming_soon_tab(self, icon: str, title: str, desc: str) -> QWidget:
         """Build a polished 'coming soon' tab card."""

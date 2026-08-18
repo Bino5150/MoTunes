@@ -67,7 +67,7 @@ def build_export_filename(track) -> str:
 
 
 class TransferEngine:
-    def __init__(self):
+    def __init__(self, can_write: Optional[Callable[[], bool]] = None):
         self._queue: List[TransferJob] = []
         self._running = False
         self._cancel_requested = False
@@ -78,6 +78,14 @@ class TransferEngine:
         self._on_job_complete: Optional[Callable] = None
         self._on_all_complete: Optional[Callable] = None
         self._chunk_size = 1024 * 512  # 512KB chunks
+        # Consulted per-job, not just by the UI button that queued it —
+        # a caller that adds/starts a TO_DEVICE job directly must still
+        # be refused if device writes are currently prohibited. Defaults
+        # to always-allowed so callers that don't care about write
+        # policy (or don't handle TO_DEVICE at all) see no behavior
+        # change; core/transfer.py itself never imports the capability
+        # module — this stays a plain predicate.
+        self._can_write: Callable[[], bool] = can_write or (lambda: True)
 
     @property
     def is_running(self) -> bool:
@@ -220,6 +228,17 @@ class TransferEngine:
         job.status = TransferStatus.IN_PROGRESS
         if self._on_job_start:
             self._on_job_start(job)
+
+        if job.direction == TransferDirection.TO_DEVICE and not self._can_write():
+            # Checked here, not just before queueing, so a job that
+            # somehow got queued while writes were allowed (or added by
+            # a caller bypassing the UI's own guard) still can't reach
+            # open(destination, "wb") once policy denies writes.
+            job.status = TransferStatus.FAILED
+            job.error = "Device writes are disabled by current capability policy."
+            if self._on_job_complete:
+                self._on_job_complete(job)
+            return
 
         try:
             dest_dir = os.path.dirname(job.destination)

@@ -10,6 +10,8 @@ import threading
 from dataclasses import dataclass
 from typing import Optional, Callable
 
+from core.capability import CapabilityDecision, RuntimeCapability, decide_policy, probe_capability
+
 
 # ── iPhone model name lookup ──────────────────────────────────────────────────
 # Maps ProductType identifiers to marketing names
@@ -122,9 +124,17 @@ class DeviceInfo:
 
 
 class DeviceManager:
-    def __init__(self):
+    def __init__(self, capability_provider: Optional[Callable[[], CapabilityDecision]] = None):
         self._device: Optional[DeviceInfo] = None
         self._mount_dir: Optional[str] = None
+        # Defaults to the real probe; tests inject a synthetic provider so
+        # behavior never depends on what happens to be installed on the
+        # machine running the suite. Starts decided against an all-absent
+        # RuntimeCapability (fails closed — "not yet probed" must never
+        # read as "probably fine") until refresh_capability() actually runs.
+        self._capability_provider = capability_provider or (lambda: decide_policy(probe_capability()))
+        self._capability_lock = threading.Lock()
+        self._capability: CapabilityDecision = decide_policy(RuntimeCapability())
         # Guards self._mount_dir. mount_media() can run on the Qt main
         # thread (via MainWindow's "Mount Device" button) at the same time
         # the poll thread's _poll_loop calls unmount_current() on a real
@@ -154,6 +164,31 @@ class DeviceManager:
     def set_callbacks(self, on_connected: Callable, on_disconnected: Callable):
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
+
+    @property
+    def capability(self) -> CapabilityDecision:
+        """The most recently computed capability decision. Never None —
+        before the first refresh_capability() call this reads as the
+        fail-closed 'nothing detected yet' state, not an assumption of
+        safety."""
+        with self._capability_lock:
+            return self._capability
+
+    def refresh_capability(self) -> CapabilityDecision:
+        """
+        Re-run the capability probe now and cache the result. Cheap
+        fact-gathering (PATH lookups + one bounded `ifuse --version`
+        call) — safe to call at startup for the UI's initial state, and
+        again immediately before mount_media() actually shells out to
+        ifuse, so a stale startup-time probe can never authorize a mount
+        the current environment wouldn't. Never call this from the
+        device poll loop — it must stay a cheap connect/disconnect
+        check, not a dependency-diagnostics benchmark on every tick.
+        """
+        decision = self._capability_provider()
+        with self._capability_lock:
+            self._capability = decision
+        return decision
 
     @property
     def is_polling(self) -> bool:
@@ -323,11 +358,25 @@ class DeviceManager:
     def mount_media(self) -> Optional[str]:
         """Mount iPhone media (Music, DCIM) via ifuse.
 
+        Capability is re-probed right here, immediately before the ifuse
+        subprocess call — not just trusted from whatever a startup-time
+        probe found — so a hard-blocked or otherwise unmountable
+        environment (exact ifuse 1.2.0, ifuse missing, no viable unmount
+        tool) can never reach the actual ifuse invocation, regardless of
+        who calls this method or when. This check lives in mount_media()
+        itself rather than only in its UI caller specifically so that
+        directly invoking this method can't bypass it.
+
         On success, records the mount as this manager's single tracked
         active mount (self._mount_dir) so unmount_current()/disconnect()
         actually have something to tear down. A failed mount never leaves
         self._mount_dir pointing at a directory that isn't really mounted.
         """
+        decision = self.refresh_capability()
+        if not decision.can_mount:
+            print(f"[DeviceManager] Mount refused: {decision.reason}")
+            return None
+
         mount_dir = None
         try:
             mount_dir = tempfile.mkdtemp(prefix="motunes_media_")
@@ -367,13 +416,23 @@ class DeviceManager:
             return 0, 0
 
     def _do_unmount(self, path: str):
-        """Best-effort fusermount + rmdir. Never raises — a path that's
-        already unmounted or already removed is not an error here."""
-        try:
-            subprocess.run(["fusermount", "-u", path],
-                           capture_output=True, timeout=5)
-        except Exception:
-            pass
+        """Best-effort unmount + rmdir. Never raises — a path that's
+        already unmounted or already removed is not an error here.
+
+        Tries fusermount3 first (the libfuse3 generation current ifuse
+        depends on), falling back to fusermount (legacy libfuse2 installs,
+        or distros that only ship the older name) — a system may
+        genuinely have only one of the two, so this doesn't blindly
+        assume either one's presence."""
+        for binary in ("fusermount3", "fusermount"):
+            try:
+                subprocess.run([binary, "-u", path],
+                               capture_output=True, timeout=5)
+                break
+            except FileNotFoundError:
+                continue
+            except Exception:
+                break
         try:
             os.rmdir(path)
         except Exception:
