@@ -35,7 +35,10 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.device import DeviceManager, DeviceInfo
 from core.music import MusicScanner, Track
-from core.photos import PhotoScanner, Photo
+from core.photos import (
+    PhotoScanner, Photo, PhotoDeleteWorker, DeleteUnit, DeleteResult,
+    find_live_photo_companion,
+)
 from core.transfer import TransferEngine, TransferDirection, TransferStatus
 
 
@@ -383,6 +386,17 @@ class _TransferBridge(QObject):
     pumping an event loop, which a bare threading.Thread never does.
     """
     job_progress  = Signal(object)   # TransferJob
+    all_complete  = Signal()
+
+
+class _PhotoDeleteBridge(QObject):
+    """
+    Qt signal bridge for PhotoDeleteWorker callbacks — same reasoning as
+    _TransferBridge: the worker invokes on_result/on_all_complete directly
+    from its background thread, so they're wired to these signal
+    emitters, never to the slots themselves.
+    """
+    result        = Signal(object)   # DeleteResult
     all_complete  = Signal()
 
 
@@ -1560,29 +1574,24 @@ class PhotoGrid(QWidget):
         elif action == delete_act:
             self.delete_requested.emit()
 
-    def delete_selected(self):
-        """Delete the selected items from the iPhone via the ifuse mount.
-        Returns (deleted_paths: set, failed_filenames: list)."""
-        to_delete = self.selected_photos
-        failed = []
-        deleted_paths = set()
-        for photo in to_delete:
-            try:
-                os.remove(photo.path)
-                deleted_paths.add(photo.path)
-            except Exception as e:
-                failed.append(photo.filename)
-                print(f"[PhotoGrid] Delete failed: {photo.path} — {e}")
+    def remove_deleted(self, deleted_paths: set):
+        """
+        Refresh the grid to drop items confirmed removed from the device.
 
-        if deleted_paths:
-            remaining = [p for p in self._photos if p.path not in deleted_paths]
-            self.load(remaining)
-            if remaining:
-                # Thumbnails were already generated earlier; re-apply the cached
-                # ones against the new (post-delete) indices rather than rescanning.
-                self.apply_thumbnails(list(range(len(remaining))))
-
-        return deleted_paths, failed
+        This does no filesystem work itself — PhotosTab owns the actual
+        delete operation (via PhotoDeleteWorker, off the Qt main thread)
+        and calls this only once real results are known, with exactly the
+        paths that are actually gone. An item is never dropped from the
+        UI merely because a delete was attempted.
+        """
+        if not deleted_paths:
+            return
+        remaining = [p for p in self._photos if p.path not in deleted_paths]
+        self.load(remaining)
+        if remaining:
+            # Thumbnails were already generated earlier; re-apply the cached
+            # ones against the new (post-delete) indices rather than rescanning.
+            self.apply_thumbnails(list(range(len(remaining))))
 
     def apply_thumbnails(self, indices: list):
         """Called from PhotosTab when thumbnails are ready."""
@@ -1640,6 +1649,35 @@ class PhotosTab(QWidget):
         self._bridge.complete.connect(self._on_scan_complete)
         self._bridge.thumbs.connect(self._apply_thumbnails)
         self._bridge.thumb_done.connect(self._on_thumb_done)
+
+        # Persistent transfer engine — PhotosTab owns this for its whole
+        # lifetime rather than _export_all/_export_selected each spinning
+        # up (and immediately losing all ownership of) a throwaway
+        # TransferEngine(). Same Qt signal-bridge pattern as Music/My
+        # Computer: TransferEngine's callbacks run on its worker thread,
+        # so they're wired to bridge signal emitters, never called directly.
+        self._transfer = TransferEngine()
+        self._transfer_bridge = _TransferBridge()
+        self._transfer_bridge.job_progress.connect(self._on_transfer_progress)
+        self._transfer_bridge.all_complete.connect(self._on_transfer_complete)
+        self._transfer.set_callbacks(
+            on_job_progress=self._transfer_bridge.job_progress.emit,
+            on_all_complete=self._transfer_bridge.all_complete.emit,
+        )
+
+        # Persistent delete worker — same ownership principle as the
+        # transfer engine. A single os.remove() can't be safely preempted
+        # mid-operation like a chunked copy, so this has no cancel(); see
+        # PhotoDeleteWorker's docstring.
+        self._delete_worker = PhotoDeleteWorker()
+        self._delete_bridge = _PhotoDeleteBridge()
+        self._delete_bridge.result.connect(self._on_delete_result)
+        self._delete_bridge.all_complete.connect(self._on_delete_all_complete)
+        self._delete_worker.set_callbacks(
+            on_result=self._delete_bridge.result.emit,
+            on_all_complete=self._delete_bridge.all_complete.emit,
+        )
+        self._delete_results: List[DeleteResult] = []
 
         self._setup_ui()
         self._scanner.set_callbacks(
@@ -1798,6 +1836,13 @@ class PhotosTab(QWidget):
         layout.addWidget(self.empty_label)
         self.sub_tabs.hide()
 
+        # Transfer progress (export)
+        self.transfer_bar = QProgressBar()
+        self.transfer_bar.setFixedHeight(20)
+        self.transfer_bar.setTextVisible(True)
+        self.transfer_bar.hide()
+        layout.addWidget(self.transfer_bar)
+
         # Switch selection tracking when sub-tab changes
         self.sub_tabs.currentChanged.connect(self._on_subtab_changed)
 
@@ -1813,8 +1858,11 @@ class PhotosTab(QWidget):
     def _on_selection_changed(self, count: int):
         if count:
             self.sel_label.setText(f"{count} selected")
-            self.export_sel_btn.setEnabled(True)
-            self.delete_btn.setEnabled(True)
+            # Selecting a different item mid-operation must not silently
+            # re-enable a button an active export/delete just disabled.
+            active = self.is_media_operation_active()
+            self.export_sel_btn.setEnabled(not active)
+            self.delete_btn.setEnabled(not active)
         else:
             self.sel_label.setText("")
             self.export_sel_btn.setEnabled(False)
@@ -1916,9 +1964,64 @@ class PhotosTab(QWidget):
         videos = len(self._videos_list) if hasattr(self, '_videos_list') else 0
         self.status_message.emit(f"{photos} photos, {videos} videos — ready")
 
+    # ── Media operation exclusion ────────────────────────────────────────────
+    #
+    # Export and delete both act on the same on-device files, driven by two
+    # independent workers (TransferEngine, PhotoDeleteWorker) with no
+    # coordination between them. Without an explicit gate, a delete could
+    # remove a file out from under an export that's mid-read of it (or vice
+    # versa) — the two engines' own single-worker guards only stop a
+    # collision with *themselves*, not with each other. is_media_operation_active()
+    # is the one predicate every entry point checks, so "is it safe to start
+    # X" is answered in exactly one place rather than several
+    # slightly-different conditions scattered through the UI.
+
+    def is_media_operation_active(self) -> bool:
+        """True while either the export engine or the delete worker owns
+        the Photos media path — export and delete are mutually exclusive."""
+        return self._transfer.is_running or self._delete_worker.is_running
+
+    def _media_operation_busy_message(self) -> str:
+        """Truthful, specific reason a start was refused — names whichever
+        operation is actually running, not just the one the user clicked."""
+        if self._transfer.is_running:
+            return "An export is already in progress — please wait for it to finish."
+        if self._delete_worker.is_running:
+            return "A delete is already in progress — please wait for it to finish."
+        return "A media operation is already in progress — please wait for it to finish."
+
+    def _set_media_controls_enabled(self, enabled: bool):
+        """
+        Enable/disable every control that starts an export or delete
+        together. Export and delete are mutually exclusive, so starting
+        either must visibly disable both — not just the one that started.
+        """
+        has_selection = len(self._current_grid().selected_photos) > 0
+        self.export_all_btn.setEnabled(enabled)
+        self.export_sel_btn.setEnabled(enabled and has_selection)
+        self.delete_btn.setEnabled(enabled and has_selection)
+
     # ── Export ────────────────────────────────────────────────────────────────
 
+    def _paths_for_export(self, items: List[Photo]) -> List[str]:
+        """
+        Expand a user selection into every file that must actually be
+        copied — a selected Live Photo still pulls its paired .MOV along
+        with it, so the pair travels as one logical asset even though the
+        companion was never itself selectable in the grid.
+        """
+        paths = []
+        for photo in items:
+            paths.append(photo.path)
+            companion = find_live_photo_companion(photo, self._all_media)
+            if companion is not None:
+                paths.append(companion.path)
+        return paths
+
     def _export_all(self):
+        if self.is_media_operation_active():
+            self.status_message.emit(self._media_operation_busy_message())
+            return
         grid = self._current_grid()
         items = grid.all_photos
         if not items:
@@ -1927,12 +2030,12 @@ class PhotosTab(QWidget):
         dest_dir = QFileDialog.getExistingDirectory(self, "Export All To...")
         if not dest_dir:
             return
-        engine = TransferEngine()
-        engine.add_jobs([p.path for p in items], dest_dir, TransferDirection.FROM_DEVICE)
-        engine.start()
-        self.status_message.emit(f"Exporting {len(items)} items to {dest_dir}…")
+        self._start_export(items, dest_dir)
 
     def _export_selected(self):
+        if self.is_media_operation_active():
+            self.status_message.emit(self._media_operation_busy_message())
+            return
         grid = self._current_grid()
         items = grid.selected_photos
         if not items:
@@ -1940,21 +2043,67 @@ class PhotosTab(QWidget):
         dest_dir = QFileDialog.getExistingDirectory(self, "Export Selected To...")
         if not dest_dir:
             return
-        engine = TransferEngine()
-        engine.add_jobs([p.path for p in items], dest_dir, TransferDirection.FROM_DEVICE)
-        engine.start()
+        self._start_export(items, dest_dir)
         grid.clear_selection()
+
+    def _start_export(self, items: List[Photo], dest_dir: str):
+        paths = self._paths_for_export(items)
+        self._transfer.clear()
+        self._transfer.add_jobs(paths, dest_dir, TransferDirection.FROM_DEVICE)
+        self._set_media_controls_enabled(False)
+        self.transfer_bar.setRange(0, len(paths))
+        self.transfer_bar.setValue(0)
+        self.transfer_bar.show()
+        # Count in terms users understand — the number of items they
+        # selected, not the (possibly larger) underlying file count once
+        # Live Photo companions are folded in.
         self.status_message.emit(f"Exporting {len(items)} item(s) to {dest_dir}…")
+        self._transfer.start()
+
+    def is_transfer_active(self) -> bool:
+        """Public state MainWindow can check before unmounting/closing."""
+        return self._transfer.is_running
+
+    def _on_transfer_progress(self, job):
+        """Slot: connected to _transfer_bridge.job_progress — always on main thread."""
+        completed = sum(1 for j in self._transfer.queue if j.status == TransferStatus.COMPLETE)
+        self.transfer_bar.setValue(completed)
+
+    def _on_transfer_complete(self):
+        """
+        Slot: connected to _transfer_bridge.all_complete — always on main
+        thread. "Complete" in the status message means every job actually
+        succeeded — a batch that finished with some jobs FAILED must never
+        be reported as unqualified success.
+        """
+        self.transfer_bar.hide()
+        self._set_media_controls_enabled(True)
+        failed = [j for j in self._transfer.queue if j.status == TransferStatus.FAILED]
+        if failed:
+            self.status_message.emit(f"Export finished — {len(failed)} file(s) failed")
+        else:
+            self.status_message.emit("Export complete!")
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
+    def _build_delete_unit(self, photo: Photo) -> DeleteUnit:
+        companion = None if photo.is_video else find_live_photo_companion(photo, self._all_media)
+        return DeleteUnit(still=photo, companion=companion)
+
     def _delete_selected(self):
+        if self.is_media_operation_active():
+            self.status_message.emit(self._media_operation_busy_message())
+            return
+
         grid = self._current_grid()
         items = grid.selected_photos
         if not items:
             return
 
-        count = len(items)
+        units = [self._build_delete_unit(p) for p in items]
+        # Count in terms users understand — one unit per selected item,
+        # even though a Live Photo unit deletes two files underneath.
+        count = len(units)
         reply = QMessageBox.question(
             self, "Delete from iPhone",
             f"Permanently delete {count} item(s) from your iPhone?\n\nThis cannot be undone.",
@@ -1964,7 +2113,44 @@ class PhotosTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
-        deleted_paths, failed = grid.delete_selected()
+        # Captured now, not re-derived at completion time — the active
+        # sub-tab could change while the delete is still running.
+        self._active_delete_grid = grid
+        self._delete_results = []
+        self._set_media_controls_enabled(False)
+        self.status_message.emit(f"Deleting {count} item(s)...")
+        self._delete_worker.start(units)
+
+    def is_delete_active(self) -> bool:
+        return self._delete_worker.is_running
+
+    def wait_for_delete(self, timeout: Optional[float] = None) -> bool:
+        """
+        Bounded wait for an in-flight delete to actually finish. Deletion
+        has no cancel() (see PhotoDeleteWorker) — this is the only way a
+        caller such as MainWindow's shutdown gate can know it's safe to
+        proceed, rather than assuming "requested" means "done".
+        """
+        return self._delete_worker.join(timeout=timeout)
+
+    def _on_delete_result(self, result: DeleteResult):
+        """Slot: connected to _delete_bridge.result — always on main thread."""
+        self._delete_results.append(result)
+
+    def _on_delete_all_complete(self):
+        """Slot: connected to _delete_bridge.all_complete — always on main thread."""
+        self._set_media_controls_enabled(True)
+        results, self._delete_results = self._delete_results, []
+
+        deleted_paths = set()
+        failed_names = []
+        for r in results:
+            if r.still_deleted:
+                deleted_paths.add(r.still.path)
+            if r.companion is not None and r.companion_deleted:
+                deleted_paths.add(r.companion.path)
+            if not r.fully_deleted:
+                failed_names.append(r.still.filename)
 
         if deleted_paths:
             self._all_media = [m for m in self._all_media if m.path not in deleted_paths]
@@ -1978,15 +2164,19 @@ class PhotosTab(QWidget):
             self.count_label.setText(f"{len(self._all_media)} items")
             self.sub_tabs.setTabText(0, f"📷  Photos ({len(self._photos_list)})")
             self.sub_tabs.setTabText(1, f"🎬  Videos ({len(self._videos_list)})")
+            grid = getattr(self, "_active_delete_grid", None) or self._current_grid()
+            grid.remove_deleted(deleted_paths)
 
-        if failed:
+        if failed_names:
             QMessageBox.warning(
                 self, "Some Deletes Failed",
-                f"Could not delete {len(failed)} item(s):\n" + "\n".join(failed[:10])
+                f"Could not delete {len(failed_names)} item(s):\n" + "\n".join(failed_names[:10])
             )
-            self.status_message.emit(f"Deleted {len(deleted_paths)} item(s) ({len(failed)} failed)")
+            self.status_message.emit(
+                f"Deleted {len(results) - len(failed_names)} item(s) ({len(failed_names)} failed)"
+            )
         elif deleted_paths:
-            self.status_message.emit(f"Deleted {len(deleted_paths)} item(s) from iPhone")
+            self.status_message.emit(f"Deleted {len(results)} item(s) from iPhone")
 
 
 
@@ -3283,6 +3473,8 @@ class MainWindow(QMainWindow):
             active.append("Music")
         if self.my_computer_tab.is_transfer_active():
             active.append("My Computer")
+        if self.photos_tab.is_transfer_active():
+            active.append("Photos")
         return active
 
     def _cancel_and_wait_for_active_transfers(self) -> bool:
@@ -3294,7 +3486,7 @@ class MainWindow(QMainWindow):
         the stop and does not confirm a write already in flight has
         actually ended.
         """
-        engines = [self.music_tab._transfer, self.my_computer_tab._transfer]
+        engines = [self.music_tab._transfer, self.my_computer_tab._transfer, self.photos_tab._transfer]
         for engine in engines:
             if engine.is_running:
                 engine.cancel()
@@ -3334,6 +3526,24 @@ class MainWindow(QMainWindow):
                     "stopped safely in time, so it's staying open rather "
                     "than risk corrupting a file on your iPhone. Please "
                     "wait a moment and try closing again.",
+                )
+                event.ignore()
+                return
+
+        if self.photos_tab.is_delete_active():
+            # A filesystem delete can't be safely preempted mid-item like a
+            # chunked copy (see PhotoDeleteWorker) — there is no cancel to
+            # offer, so no "quit anyway" override here either. Wait,
+            # bounded, for it to actually finish; refuse to close if it
+            # hasn't, since unmounting mid-delete risks exactly the class
+            # of corruption this whole safety pass exists to prevent.
+            if not self.photos_tab.wait_for_delete(timeout=self._CLOSE_CANCEL_JOIN_TIMEOUT):
+                QMessageBox.warning(
+                    self, "Delete In Progress",
+                    "MoTunes could not confirm the in-progress delete "
+                    "finished in time, so it's staying open rather than "
+                    "risk unmounting mid-delete. Please wait a moment and "
+                    "try closing again.",
                 )
                 event.ignore()
                 return

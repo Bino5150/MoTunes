@@ -64,11 +64,46 @@ class Photo:
         return Path(self.filename).suffix.upper().lstrip(".")
 
 
+def find_live_photo_companion(still: Photo, all_media: List[Photo]) -> Optional[Photo]:
+    """
+    Return the paired Live Photo .MOV component for `still`, or None if
+    `still` isn't a photo with a companion in `all_media`.
+
+    Mirrors PhotoScanner's own pairing rule exactly (same directory, same
+    filename stem, case-insensitive) — the .MOV component itself is
+    flagged is_live_photo=True and deliberately excluded from the visible
+    video grid, so it's only ever reachable through this lookup, not
+    through direct user selection.
+    """
+    if still.is_video:
+        return None
+    still_dir = os.path.dirname(still.path)
+    still_stem = Path(still.filename).stem.lower()
+    for media in all_media:
+        if (media.is_video and media.is_live_photo
+                and os.path.dirname(media.path) == still_dir
+                and Path(media.filename).stem.lower() == still_stem):
+            return media
+    return None
+
+
 class PhotoScanner:
     def __init__(self, thumb_dir: str = "/tmp/motunes_thumbs"):
         self._photos: List[Photo] = []
         self._thumb_dir = thumb_dir
-        self._stop_thumbs = False
+        # Per-run identity, not a shared stop flag. The old design used one
+        # shared _stop_thumbs bool that _phase1_discover reset to False at
+        # its own start — a scan superseding an in-flight one could have
+        # its "stop" request silently erased by the very run it was meant
+        # to stop, since both scans shared the same flag. Every worker
+        # thread instead carries the generation number it was spawned
+        # with, fixed for its whole lifetime; scan_async() bumps the
+        # counter, and workers compare their own number against the
+        # current one before ever publishing anything. A generation that's
+        # been superseded can never win that comparison again, no matter
+        # how its timing lines up with the new scan starting.
+        self._generation = 0
+        self._generation_lock = threading.Lock()
 
         # Phase 1 callbacks
         self._on_progress: Optional[Callable] = None       # (current, total, photo)
@@ -92,25 +127,36 @@ class PhotoScanner:
         self._on_thumbnails_ready = on_thumbnails_ready
         self._on_thumb_complete = on_thumb_complete
 
+    def _is_current(self, generation: int) -> bool:
+        with self._generation_lock:
+            return generation == self._generation
+
     def scan_async(self, mount_point: str):
         """Start Phase 1 (discovery) in a background thread."""
-        self._stop_thumbs = True   # Cancel any in-flight thumbnail generation
+        with self._generation_lock:
+            self._generation += 1
+            generation = self._generation
         self._photos = []
         thread = threading.Thread(
-            target=self._phase1_discover, args=(mount_point,), daemon=True
+            target=self._phase1_discover, args=(mount_point, generation), daemon=True
         )
         thread.start()
 
     # ── Phase 1: Discovery ────────────────────────────────────────────────────
 
-    def _phase1_discover(self, mount_point: str):
+    def _phase1_discover(self, mount_point: str, generation: int):
         """
         Stat-only scan: build stubs and fire progress IN the walk loop,
         one directory at a time. The UI gets photos as each DCIM/###APPLE
         folder is read — no waiting for the full walk to finish.
+
+        Builds into a run-local list (`run_photos`), never the shared
+        self._photos, until this generation is confirmed to still be
+        current — so a superseded run can never leave a partially-built
+        list sitting in self._photos for anyone else to read.
         """
-        self._stop_thumbs = False
         search_root = self._find_dcim(mount_point)
+        run_photos: List[Photo] = []
 
         # Fire an early on_complete once we have enough to fill the screen
         EARLY_FIRE_THRESHOLD = 50
@@ -118,8 +164,8 @@ class PhotoScanner:
 
         try:
             for dirpath, dirnames, filenames in os.walk(search_root):
-                if self._stop_thumbs:
-                    break
+                if not self._is_current(generation):
+                    return
                 # Skip hidden dirs to avoid AFC hangs
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
 
@@ -133,8 +179,8 @@ class PhotoScanner:
 
                 # Build stubs for every media file in this directory immediately
                 for fname in filenames:
-                    if self._stop_thumbs:
-                        break
+                    if not self._is_current(generation):
+                        return
                     ext = Path(fname).suffix.lower()
                     if ext in SKIP_EXTENSIONS:
                         continue
@@ -150,31 +196,39 @@ class PhotoScanner:
 
                     photo = self._make_stub(fpath, is_live_photo=is_live)
                     if photo:
-                        self._photos.append(photo)
+                        run_photos.append(photo)
                         if self._on_progress:
                             self._on_progress(
-                                len(self._photos), len(self._photos), photo
+                                len(run_photos), len(run_photos), photo
                             )
 
                 # After each directory, fire on_complete early once we have
                 # enough photos to show something useful
                 if (not _fired_initial
-                        and len(self._photos) >= EARLY_FIRE_THRESHOLD):
+                        and len(run_photos) >= EARLY_FIRE_THRESHOLD
+                        and self._is_current(generation)):
+                    self._photos = list(run_photos)
                     if self._on_complete:
-                        self._on_complete(list(self._photos))
+                        self._on_complete(list(run_photos))
                     _fired_initial = True
 
         except Exception as e:
             print(f"[PhotoScanner] Walk error: {e}")
 
-        # Final on_complete with full list (always fires)
-        if self._on_complete:
-            self._on_complete(list(self._photos))
+        if not self._is_current(generation):
+            return
 
-        # Kick off Phase 2 thumbnail generation
-        if self._photos and not self._stop_thumbs and HAS_PIL:
+        # Final on_complete with full list (always fires)
+        self._photos = list(run_photos)
+        if self._on_complete:
+            self._on_complete(list(run_photos))
+
+        # Kick off Phase 2 thumbnail generation, against this run's own
+        # list — never self._photos, which a newer generation is free to
+        # reassign at any moment.
+        if run_photos and HAS_PIL:
             thumb_thread = threading.Thread(
-                target=self._phase2_thumbnails, daemon=True
+                target=self._phase2_thumbnails, args=(generation, run_photos), daemon=True
             )
             thumb_thread.start()
 
@@ -218,16 +272,28 @@ class PhotoScanner:
 
     # ── Phase 2: Thumbnail Generation ────────────────────────────────────────
 
-    def _phase2_thumbnails(self):
+    def _phase2_thumbnails(self, generation: int, photos: List[Photo]):
         """
         Generate thumbnails for non-video, non-HEIC photos in the background.
         Fires on_thumbnails_ready in batches so the grid refreshes incrementally.
+
+        `photos` is this run's own list, passed explicitly by
+        _phase1_discover rather than read from self._photos — a newer
+        generation reassigning self._photos partway through can never
+        change what this run iterates. Every publish point re-checks
+        `generation` against the current one; once superseded, this run
+        stops publishing (progress callbacks, completion) but keeps
+        running to completion quietly rather than trying to tear down a
+        background thread from outside it.
         """
+        if not self._is_current(generation):
+            return
+
         batch_indices = []
 
-        for i, photo in enumerate(self._photos):
-            if self._stop_thumbs:
-                break
+        for i, photo in enumerate(photos):
+            if not self._is_current(generation):
+                return
             if photo.is_video or photo.thumb_loaded:
                 continue
 
@@ -242,15 +308,20 @@ class PhotoScanner:
             batch_indices.append(i)
 
             if len(batch_indices) >= THUMB_BATCH_SIZE:
+                if not self._is_current(generation):
+                    return
                 if self._on_thumbnails_ready:
                     self._on_thumbnails_ready(list(batch_indices))
                 batch_indices = []
+
+        if not self._is_current(generation):
+            return
 
         # Fire remaining batch
         if batch_indices and self._on_thumbnails_ready:
             self._on_thumbnails_ready(list(batch_indices))
 
-        if not self._stop_thumbs and self._on_thumb_complete:
+        if self._is_current(generation) and self._on_thumb_complete:
             self._on_thumb_complete()
 
     def _generate_thumbnail(self, photo: Photo):
@@ -293,3 +364,122 @@ class PhotoScanner:
     @property
     def all_media(self) -> List[Photo]:
         return self._photos
+
+
+# ── Device-file deletion ──────────────────────────────────────────────────────
+
+@dataclass
+class DeleteUnit:
+    """
+    One user-visible asset to delete — a standalone photo/video, or a Live
+    Photo still paired with its motion component. UI selection counts are
+    in terms of these units; a single unit with a companion still deletes
+    two files underneath.
+    """
+    still: Photo
+    companion: Optional[Photo] = None   # paired Live Photo .MOV, if any
+
+
+@dataclass
+class DeleteResult:
+    """
+    Truthful outcome of one DeleteUnit. still_deleted/companion_deleted
+    are independent facts, not a single pass/fail bit — a companion that
+    was removed while the still failed (or vice versa) is a real,
+    reportable partial outcome, not something to paper over.
+    """
+    still: Photo
+    companion: Optional[Photo]
+    still_deleted: bool = False
+    companion_deleted: bool = False
+    error: str = ""
+
+    @property
+    def fully_deleted(self) -> bool:
+        return self.still_deleted and (self.companion is None or self.companion_deleted)
+
+
+class PhotoDeleteWorker:
+    """
+    Background-thread deletion of selected photos/videos from the device.
+
+    Live Photo pairs are treated as one logical asset: the motion
+    component is removed first, and the still is only removed if that
+    succeeds — so a failed companion delete never leaves a pair
+    half-gone-but-reported-clean. Filesystem deletes that already
+    succeeded are never rolled back or hidden; DeleteResult reports
+    exactly what happened.
+
+    Unlike a chunked file copy, a single os.remove() can't be safely
+    preempted mid-operation, so this deliberately has no cancel() — a
+    caller that needs to know the batch has actually finished (e.g.
+    before unmounting) uses is_running / join().
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._on_result: Optional[Callable] = None        # (DeleteResult) -> None, per unit
+        self._on_all_complete: Optional[Callable] = None  # () -> None
+
+    def set_callbacks(self, on_result: Optional[Callable] = None,
+                       on_all_complete: Optional[Callable] = None):
+        self._on_result = on_result
+        self._on_all_complete = on_all_complete
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._running
+
+    def start(self, units: List[DeleteUnit]) -> bool:
+        """Begin deleting `units` in a background thread. Returns False
+        (no-op) if a batch is already running — never runs two concurrent
+        delete workers."""
+        with self._lock:
+            if self._running:
+                return False
+            self._running = True
+            thread = threading.Thread(target=self._run, args=(list(units),), daemon=True)
+            self._thread = thread
+        thread.start()
+        return True
+
+    def join(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the worker to actually finish. Returns True if it has
+        (or none was running), False if still alive when `timeout` elapses."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
+    def _run(self, units: List[DeleteUnit]):
+        for unit in units:
+            result = DeleteResult(still=unit.still, companion=unit.companion)
+            if unit.companion is not None:
+                try:
+                    os.remove(unit.companion.path)
+                    result.companion_deleted = True
+                except Exception as e:
+                    result.error = f"companion: {e}"
+                    print(f"[PhotoDeleteWorker] Companion delete failed: {unit.companion.path} — {e}")
+                    if self._on_result:
+                        self._on_result(result)
+                    continue  # companion delete failed — do not touch the still
+
+            try:
+                os.remove(unit.still.path)
+                result.still_deleted = True
+            except Exception as e:
+                result.error = (result.error + "; " if result.error else "") + f"still: {e}"
+                print(f"[PhotoDeleteWorker] Delete failed: {unit.still.path} — {e}")
+
+            if self._on_result:
+                self._on_result(result)
+
+        with self._lock:
+            self._running = False
+        if self._on_all_complete:
+            self._on_all_complete()
