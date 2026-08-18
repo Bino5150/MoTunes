@@ -4,6 +4,7 @@ Phase 1: Fast file discovery (stat only, no PIL) — fires on_complete immediate
 Phase 2: Background thumbnail generation — fires on_thumbnails_ready in batches
 """
 
+import hashlib
 import os
 import threading
 from dataclasses import dataclass
@@ -39,6 +40,19 @@ class Photo:
     date_taken: Optional[datetime] = None
     thumbnail_path: Optional[str] = None
     thumb_loaded: bool = False     # True once thumbnail has been generated
+    device_relative_path: Optional[str] = None  # path relative to the mount root
+    # at discovery time — e.g. "DCIM/100APPLE/IMG_0001.JPG". `path` itself
+    # is rooted at a fresh tempfile.mkdtemp(prefix="motunes_media_")
+    # directory that DeviceManager.mount_media() creates on every remount,
+    # so `path` alone changes across sessions even for the same on-device
+    # file. This field is the part of identity that stays constant.
+    device_id: str = ""  # stable per-device identifier (e.g. the iPhone's
+    # UDID), established at discovery time. Namespaces the cache identity
+    # alongside device_relative_path so two different physical devices
+    # whose internal DCIM layout happens to collide (e.g. both have
+    # DCIM/100APPLE/IMG_0001.JPG) don't share a thumbnail cache entry.
+    # Defaults to "" when unknown — a single shared namespace, same as
+    # before this field existed.
 
     @property
     def size_str(self) -> str:
@@ -87,6 +101,25 @@ def find_live_photo_companion(still: Photo, all_media: List[Photo]) -> Optional[
     return None
 
 
+def thumbnail_cache_name(identity_path: str, size_bytes: int, mtime: Optional[datetime]) -> str:
+    """
+    Deterministic, filesystem-safe cache filename for a photo's thumbnail.
+
+    `identity_path` must be a stable identity, not a raw filesystem path —
+    callers are responsible for passing something that stays constant for
+    the "same" source media across sessions (see Photo.device_relative_path).
+    This helper only turns that identity, plus size + mtime for
+    invalidation, into a deterministic digest via hashlib.sha256 — never
+    the built-in hash(), which is randomized per-process by PYTHONHASHSEED
+    and previously made every thumbnail's cache identity change across app
+    restarts.
+    """
+    mtime_key = mtime.isoformat() if mtime else ""
+    identity = f"{identity_path}|{size_bytes}|{mtime_key}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{digest}.jpg"
+
+
 class PhotoScanner:
     def __init__(self, thumb_dir: str = "/tmp/motunes_thumbs"):
         self._photos: List[Photo] = []
@@ -131,20 +164,28 @@ class PhotoScanner:
         with self._generation_lock:
             return generation == self._generation
 
-    def scan_async(self, mount_point: str):
-        """Start Phase 1 (discovery) in a background thread."""
+    def scan_async(self, mount_point: str, device_id: str = ""):
+        """Start Phase 1 (discovery) in a background thread.
+
+        `device_id` should be a stable per-device identifier (e.g. the
+        connected iPhone's UDID) when the caller has one — see
+        Photo.device_id. Optional and defaults to "" for callers (and
+        existing tests) with no device identity to hand — falls back to a
+        single shared cache namespace, same as before this parameter
+        existed.
+        """
         with self._generation_lock:
             self._generation += 1
             generation = self._generation
         self._photos = []
         thread = threading.Thread(
-            target=self._phase1_discover, args=(mount_point, generation), daemon=True
+            target=self._phase1_discover, args=(mount_point, generation, device_id), daemon=True
         )
         thread.start()
 
     # ── Phase 1: Discovery ────────────────────────────────────────────────────
 
-    def _phase1_discover(self, mount_point: str, generation: int):
+    def _phase1_discover(self, mount_point: str, generation: int, device_id: str = ""):
         """
         Stat-only scan: build stubs and fire progress IN the walk loop,
         one directory at a time. The UI gets photos as each DCIM/###APPLE
@@ -194,7 +235,7 @@ class PhotoScanner:
                         and Path(fname).stem.lower() in photo_stems
                     )
 
-                    photo = self._make_stub(fpath, is_live_photo=is_live)
+                    photo = self._make_stub(fpath, mount_point, device_id, is_live_photo=is_live)
                     if photo:
                         run_photos.append(photo)
                         if self._on_progress:
@@ -251,8 +292,16 @@ class PhotoScanner:
         print(f"[PhotoScanner] WARNING: No DCIM directory found at {mount_point}")
         return mount_point
 
-    def _make_stub(self, fpath: str, is_live_photo: bool = False) -> Optional[Photo]:
-        """Create a Photo with just stat info — no PIL, no file reading."""
+    def _make_stub(
+        self, fpath: str, mount_point: str, device_id: str = "", is_live_photo: bool = False
+    ) -> Optional[Photo]:
+        """Create a Photo with just stat info — no PIL, no file reading.
+
+        `mount_point` and `device_id` are this run's own arguments (never
+        read from self._something), so the identity they produce is fixed
+        to the run that discovered the photo — safe even if a newer scan
+        reassigns the scanner's state around it later.
+        """
         try:
             stat = os.stat(fpath)
             fname = os.path.basename(fpath)
@@ -265,6 +314,8 @@ class PhotoScanner:
                 is_live_photo=is_live_photo,
                 date_taken=datetime.fromtimestamp(stat.st_mtime),
                 thumb_loaded=False,
+                device_relative_path=os.path.relpath(fpath, mount_point),
+                device_id=device_id,
             )
         except Exception as e:
             print(f"[PhotoScanner] Stub error {fpath}: {e}")
@@ -325,9 +376,26 @@ class PhotoScanner:
             self._on_thumb_complete()
 
     def _generate_thumbnail(self, photo: Photo):
-        """Generate a 200×200 JPEG thumbnail, cached by path hash."""
+        """Generate a 200×200 JPEG thumbnail, cached by a stable content-identity key.
+
+        Keys on device_id + device_relative_path, not photo.path —
+        photo.path is rooted at this session's own tempfile.mkdtemp(
+        prefix="motunes_media_") mount directory and is different every
+        time the device is remounted, even for the exact same on-device
+        file. device_relative_path alone isn't enough either: two
+        different physical devices can have the same internal layout
+        (e.g. both have DCIM/100APPLE/IMG_0001.JPG), so device_id
+        namespaces the identity per-device. Falls back to photo.path only
+        for Photo objects built outside discovery (e.g. direct unit
+        construction), which have no mount root to strip and no device
+        identity to namespace with.
+        """
         try:
-            thumb_name = f"{abs(hash(photo.path))}.jpg"
+            if photo.device_relative_path is not None:
+                identity_path = f"{photo.device_id}:{photo.device_relative_path}"
+            else:
+                identity_path = photo.path
+            thumb_name = thumbnail_cache_name(identity_path, photo.file_size_bytes, photo.date_taken)
             thumb_path = os.path.join(self._thumb_dir, thumb_name)
 
             if not os.path.exists(thumb_path):

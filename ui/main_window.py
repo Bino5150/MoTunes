@@ -1695,6 +1695,7 @@ class PhotosTab(QWidget):
         self._scanner = PhotoScanner()
         self._all_media: List[Photo] = []
         self._mount_point: Optional[str] = None
+        self._device_id: str = ""
         # Defaults to write-enabled until MainWindow wires the real
         # DeviceManager in via set_capability_provider(). Read dynamically
         # by the predicates below, so swapping the provider later takes
@@ -1933,18 +1934,19 @@ class PhotosTab(QWidget):
 
     # ── Scan lifecycle ────────────────────────────────────────────────────────
 
-    def load_from_mount(self, mount_point: str):
+    def load_from_mount(self, mount_point: str, device_id: str = ""):
         self._mount_point = mount_point
+        self._device_id = device_id
         self.empty_label.setText("Scanning photos...")
         self.empty_label.show()
         self.sub_tabs.hide()
         self.scan_progress.setRange(0, 0)
         self.scan_progress.show()
-        self._scanner.scan_async(mount_point)
+        self._scanner.scan_async(mount_point, device_id)
 
     def refresh(self):
         if self._mount_point:
-            self.load_from_mount(self._mount_point)
+            self.load_from_mount(self._mount_point, self._device_id)
         else:
             self.status_message.emit("No device mounted — nothing to refresh")
 
@@ -3505,7 +3507,7 @@ class MainWindow(QMainWindow):
             self.my_computer_tab.set_mount_point(mount)
             self.device_tools_tab.set_mount_point(mount)
             self.music_tab.load_from_mount(mount)
-            self.photos_tab.load_from_mount(mount)
+            self.photos_tab.load_from_mount(mount, device.udid)
         else:
             self.connect_btn.setEnabled(True)
             self.connect_btn.setText("Mount Device")
